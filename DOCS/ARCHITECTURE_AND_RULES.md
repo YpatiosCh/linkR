@@ -10,6 +10,7 @@ Companion documents (per-feature sources of truth, see [§6](#6-feature-specific
 
 - `DOCS/authentication_v1_backend_spec.md`
 - `DOCS/plans_and_entitlements_v1_backend_spec.md`
+- `DOCS/PRODUCT_VISION.md` (living product vision — what linkMe is and why; not a spec)
 
 ---
 
@@ -312,6 +313,8 @@ Per-feature behavior is defined in the spec files in `DOCS/`:
 - `plans_and_entitlements_v1_backend_spec.md` — plans (Free/Pro), entitlements,
   platform fees, subscription lifecycle, authorization architecture, and the
   **testing strategy** (sections 29–30 mandate unit tests).
+- `PRODUCT_VISION.md` — **not a spec**: the product intent, revenue model,
+  external integrations (R2, Stripe), killer features, MVP scope, and idea log.
 
 **Rules governing spec usage (Rule F1):**
 
