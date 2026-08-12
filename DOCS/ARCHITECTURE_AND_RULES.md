@@ -1,6 +1,6 @@
 # linkMe Backend — Architecture & Hard Rules
 
-> Last updated: 2026-08-11
+> Last updated: 2026-08-12
 > Applies to: the entire `linkMe` Go backend (module `linkMe`).
 
 This document is the single source of truth for **how this project is structured**
@@ -55,13 +55,30 @@ below it. Nothing ever depends upward or skips a layer.
 
 ```text
                         ┌──────────────────────────────┐
-                        │       cmd/server/main.go     │  wiring, env, pool, HTTP server
+                        │       cmd/server/main.go     │  env, config, pool, compose managers,
+                        │                              │  call router.SetupRoutes, listen :8080
                         └──────────────┬───────────────┘
                                        │  constructs
+                                       ▼
+                        ┌──────────────────────────────┐
+                        │    internal/router/router.go  │  SetupRoutes — all route registrations,
+                        │                              │  per-route rate limiters, middleware chains
+                        └──────────────┬───────────────┘
+                                       │  uses
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     internal/middleware  (HTTP middleware)               │
+│   auth.go — RequireAuth(jwtSecret), AuthClaims(r)                       │
+│   cors.go — CORS(allowedOrigins): allowlist, echo origin, preflight 204 │
+│   securityheaders.go — SecurityHeaders(appEnv): nosniff/DENY/CSP/HSTS  │
+│   ratelimit/ — New(limit, window): per-IP fixed-window middleware        │
+└──────────────────────────────────────┬──────────────────────────────────┘
+                                       │  wraps
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        internal/handlers  (HTTP layer)                  │
 │   HandlerManager ──► AuthHandler ──► auth_handler.go                    │
+│                   ──► MeHandler  ──► me_handler.go                      │
 │   decode JSON → call service → set cookies → write standardized response│
 └──────────────────────────────────────┬──────────────────────────────────┘
                                        │  depends on
@@ -89,7 +106,7 @@ below it. Nothing ever depends upward or skips a layer.
 
 Shared support packages (imported by any of the above, never importing them back):
    internal/msgs    sentinel errors (the contract between layers)
-   internal/utils   internal helpers (response, validate, token)
+   internal/utils   internal helpers (response, validate, token, jwttoken)
    pkg              self-contained helpers (dotenv, hash)
 ```
 
@@ -199,23 +216,27 @@ the handlers.
 
 Same pattern: `interface.go` + `manager.go` + one file per handler group.
 
-- `interface.go` — `Handler` (aggregate exposing `Auth() AuthHandler`) and
-  `AuthHandler` (e.g. `Register(w http.ResponseWriter, r *http.Request)`).
+- `interface.go` — `Handler` (aggregate exposing `Auth() AuthHandler` and `Me() MeHandler`),
+  `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll), `MeHandler` (GetMe/ChangePassword).
 - `manager.go` — `HandlerManager` holds concrete handler groups;
   `NewHandlerManager(service service.Service) Handler`.
-- `auth_handler.go` — `authHandler` **embeds** `service.Service`
-  (`h.Auth().Register(...)`). Canonical handler shape:
+- `auth_handler.go` — `authHandler` **embeds** `service.Service`. Canonical shape:
 
-  1. decode the JSON body into a request DTO (`registerRequest`);
-     on decode failure → `response.Error(w, http.StatusBadRequest, response.CodeInvalidBody, …)`;
+  1. decode the JSON body into a request DTO; on failure → `response.Error(w, 400, CodeInvalidBody, …)`;
   2. call the service with `r.Context()`;
   3. on service error → `response.HandleError(w, err)` (centralized mapping, §3.8);
-  4. on success → set cookies if needed (`http.SetCookie`, HttpOnly + Secure +
-     SameSite=Lax) and write `response.JSON(w, http.StatusCreated, userResponse{...})`.
+  4. on success → set cookies if needed and write `response.JSON(...)`.
 
-Request/response DTOs are declared in the handler file (`registerRequest`,
-`userResponse`). Handlers contain **no business logic** — only transport
-(decode → delegate → encode).
+- `me_handler.go` — `meHandler` handles authenticated current-user routes. Reads
+  JWT claims via `middleware.AuthClaims(r)` (imported from `internal/middleware`).
+
+⚠ **Auth middleware is not in this package.** `RequireAuth`, `AuthClaims`, and
+`bearerToken` live in `internal/middleware/auth.go` (`package middleware`). Handlers
+import `internal/middleware` to call `middleware.AuthClaims(r)`.
+
+Request/response DTOs are declared in `internal/models/request.go` and
+`internal/models/response.go` as exported types. Handlers contain **no business
+logic** — only transport (decode → delegate → encode).
 
 ### 3.6 `internal/msgs` — sentinel errors
 
@@ -264,6 +285,39 @@ client: 401/404/409/…  { "error": { "code": "USER_NOT_FOUND", "message": "user
 are logged and turned into a generic `500 INTERNAL_ERROR`** — internal details
 never leak to clients. Never bypass this pipeline with ad-hoc error shapes.
 
+### 3.9 Testing layout — tests live in root `test/`
+
+All tests live under a top-level `test/` directory, **kept separate from the
+code under test** — there are no colocated `_test.go` files inside `internal/`
+or `pkg/`. `test/` mirrors the package it exercises, one directory (and one
+external test package) per package under test:
+
+```text
+test/
+  service/    auth_service_test.go   package service_test    → linkMe/internal/service
+  handlers/   auth_handler_test.go   package handlers_test   → linkMe/internal/handlers
+  middleware/ middleware_test.go     package middleware_test  → linkMe/internal/middleware
+  jwttoken/   jwttoken_test.go       package jwttoken_test   → linkMe/internal/utils/jwttoken
+  validate/   validate_test.go       package validate_test   → linkMe/internal/utils/validate
+  token/      token_test.go          package token_test      → linkMe/internal/utils/token
+  hash/       hash_test.go           package hash_test       → linkMe/pkg/hash
+```
+
+Consequences of this layout (all intentional):
+
+- **Black-box only.** A `test/` package imports `linkMe/...` and can therefore
+  reach **only exported symbols**. Unexported functions (row mappers like
+  `dbUserToDomain`, helpers like `issueSession`) are not directly testable;
+  they are covered through the exported API that calls them. Design exported
+  seams accordingly — e.g. services take the `repository.Repository`
+  **interface**, so tests substitute a fake repository (see
+  `test/service/auth_service_test.go`).
+- **Package naming.** Each test file declares `package <pkg>_test` (not `<pkg>`)
+  so it can import the real package of the same name without a collision.
+- **Internal-import rule holds.** `test/` sits at the module root, so it is
+  permitted to import `linkMe/internal/*` packages.
+- Go still discovers and runs these under `go test ./...`; no extra wiring.
+
 ---
 
 ## 4. Cross-Cutting Conventions
@@ -282,10 +336,11 @@ conform. When in doubt, read the closest existing sibling file and mirror it.
 | Transactions | Only via `WithinTx` + context-injected tx + `querier(ctx)` (Rule C3) |
 | Error wrapping | `fmt.Errorf("context: %w", err)`; never `errors.New` for wrapped errors; never swallow errors |
 | Response envelope | Success = raw JSON payload; error = `{"error":{"code","message"}}` |
-| DTOs at boundaries | Handlers define request/response structs; domain models are not serialized directly when the shape differs |
+| DTOs at boundaries | Request/response structs live in `internal/models/request.go` and `response.go` as exported types; handlers decode into and encode from these — never define DTOs inside handler files |
 | Context | `ctx context.Context` is always the first parameter; handlers pass `r.Context()`; never `context.Background()` inside a request path |
 | Docs | Every exported symbol has a Go doc comment stating its purpose and behavior |
 | Security | Argon2id passwords, SHA-256-hashed opaque tokens, HttpOnly+Secure cookies, `crypto/subtle` constant-time compares |
+| Test placement | All tests live under the root `test/` directory, **never** as colocated `_test.go` files beside source. `test/` mirrors the package under test (`test/service/`, `test/validate/`, …), one external test package per directory (`package service_test`). Tests are black-box — they import `linkMe/...` and exercise **exported** APIs only (see [§3.9](#39-testing-layout-tests-live-in-root-test)) |
 
 ---
 
@@ -442,6 +497,12 @@ that conflicts with a rule, raise the conflict instead of silently breaking it.
   what the symbol does and any notable behavior.
 - **Q5 — Bugfix = minimal change.** Fix the bug, don't refactor the surrounding
   code while you're in there. Refactors are separate, explicitly requested work.
+- **Q6 — Tests live in root `test/`, never beside the code.** Place every test
+  under `test/`, in a directory mirroring the package under test, in an external
+  `package <pkg>_test` (see [§3.9](#39-testing-layout-tests-live-in-root-test)).
+  Never add a colocated `_test.go` inside `internal/` or `pkg/`. Tests are
+  black-box against exported APIs; use interface seams (e.g. a fake
+  `repository.Repository`) rather than reaching into unexported internals.
 
 ### 7.8 Process
 
@@ -524,18 +585,23 @@ func (r *sessionRepository) GetSessionByID(ctx context.Context, id uuid.UUID) (m
 - Implement in `auth_handler.go`: decode `loginRequest` → 400
   `CodeInvalidBody` on failure → call `h.Auth().Login(r.Context(), …)` →
   `response.HandleError` on error → set the `refresh_token` cookie → `response.JSON`.
-- Define `loginRequest`/`loginResponse` DTOs in the handler file.
+- Add `LoginRequest`/`UserResponse` to `internal/models/request.go` and `response.go` if not already present.
 
-### Step 6 — Wire the route (in `cmd/server/main.go`)
+### Step 6 — Wire the route (in `internal/router/router.go`)
 
-Construct the managers and register the route using pattern routing:
+`main.go` only constructs the managers and calls `router.SetupRoutes`. All route
+registration, rate limiter creation, and middleware chaining live in `SetupRoutes`:
 
 ```go
-repos := repository.NewRepoManager(pool)
-services := service.NewServiceManager(repos)
-handlers := handlers.NewHandlerManager(services)
+// internal/router/router.go
+mux.Handle("POST /api/v1/auth/login", rl(10, 15*time.Minute)(http.HandlerFunc(h.Auth().Login)))
+```
 
-mux.HandleFunc("POST /auth/login", handlers.Auth().Login)
+`main.go` reduces to:
+
+```go
+h := handlers.NewHandlerManager(services)
+log.Fatal(http.ListenAndServe(":8080", router.SetupRoutes(h, cfg)))
 ```
 
 ### Step 7 — Tests + verification (Q1, Q2)
@@ -552,50 +618,83 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-11. Update this section whenever a milestone lands.
+Snapshot as of 2026-08-12. Update this section whenever a milestone lands.
 
 ### Implemented
 
-- **Entry point**: `cmd/server/main.go` — dotenv load, `DATABASE_URL` check,
-  pgx pool + ping, `GET /health`, listen on `:8080`.
-  ⚠ The repository/service/handler managers are **not yet wired into `main.go`** —
-  only `/health` is registered.
-- **Schema (migrations, all 8 tables)**: users, auth_identities,
-  email_verification_tokens, password_reset_tokens, plans, user_subscriptions,
-  audit_events, sessions.
-- **Queries + generated code**: users (create/get-by-email/get-by-id),
-  auth_identities (create/get-by-provider+subject), sessions (create),
-  user_subscriptions (create).
-- **Domain models**: User, AuthIdentity, Session, Subscription, Plan/PLAN +
-  `CreatePlan`.
-- **Repository layer**: `RepoManager` + 4 entity repositories, `WithinTx` +
-  context-injected transactions, `dbXToDomain` mappers.
-- **Service layer**: `ServiceManager` + `AuthService.Register` (full flow:
-  normalize/validate → email-exists check → Argon2id hash → transactional
-  user+identity+free-subscription creation → session issuance).
-- **Handler layer**: `HandlerManager` + `AuthHandler.Register` (decode → service
-  → HttpOnly `refresh_token` cookie → 201 `userResponse`).
-- **Helpers**: `pkg/dotenv`, `pkg/hash` (Argon2id PHC), `utils/token`
-  (opaque token + SHA-256), `utils/validate`, `utils/response` (envelope,
-  codes, `errorStatusMap`, `HandleError`), `msgs` sentinel errors.
+- **Entry point**: `cmd/server/main.go` — dotenv load, config validation, pgx pool + ping,
+  composition root (repository → service → handler managers), delegates all route/middleware
+  wiring to `router.SetupRoutes(h, cfg)`, listen on `:8080`.
+- **Config**: `config/config.go` — `Config{DatabaseURL, JWTSecret, AllowedOrigins []string, AppEnv string}`.
+  `CORS_ALLOWED_ORIGINS` (comma-separated, default `http://localhost:3000`); `APP_ENV`
+  (default `"development"`). Passed to constructors via struct — never as individual args.
+- **Schema (migrations, all 8 tables)**: users, auth_identities, email_verification_tokens,
+  password_reset_tokens, plans, user_subscriptions, audit_events, sessions.
+- **Queries + generated code**: users (create/get-by-email/get-by-id), auth_identities
+  (create/get-by-provider+subject/get-by-user+provider/update-password-hash), sessions
+  (create/get-by-token-hash/mark-consumed/revoke-session/revoke-family/revoke-all-for-user/
+  revoke-other-for-user), user_subscriptions (create/get-active-by-user-id).
+- **Domain models**: User, AuthIdentity, Session, Subscription, Plan/PLAN + `CreatePlan`.
+  Request DTOs: `models/request.go` (RegisterRequest, LoginRequest, PasswordChangeRequest).
+  Response DTOs: `models/response.go` (UserResponse, RefreshResponse, MeResponse, MePlanResponse).
+- **Repository layer**: `RepoManager` + 4 entity repositories, `WithinTx` + context-injected
+  transactions, `dbXToDomain` mappers. `AuthIdentityRepository` includes
+  `GetAuthIdentityByUserIDAndProvider` + `UpdatePasswordHash`. `SessionRepository` includes
+  `RevokeSession`, `RevokeAllSessionsForUser`, `RevokeOtherSessionsForUser`.
+- **Service layer**: `ServiceManager` + full `AuthService`:
+  - `Register` — normalize/validate → email-exists check → Argon2id → transactional user+identity+free-plan → issue JWT + refresh token
+  - `Login` — normalize/validate → password identity → VerifyPassword → issue JWT + refresh token; every failure → same `ErrInvalidCredentials` (enumeration defense)
+  - `Refresh` — hash lookup → reuse detection (RevokedAt → RevokeFamily + ErrTokenReuseDetected) → expiry check → WithinTx(MarkConsumed + new session in same family) → new JWT + refresh token
+  - `Logout` — RevokeSession (idempotent)
+  - `LogoutAll` — RevokeAllSessionsForUser
+  - `GetMe` — GetUserByID + GetActiveSubscriptionByUserID
+  - `ChangePassword` — validate new password → get password identity (ErrPasswordNotSet if OAuth-only) → verify current password → Argon2id hash → WithinTx(UpdatePasswordHash + RevokeOtherSessionsForUser keeping current session)
+- **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll)
+  + `MeHandler` (GetMe/ChangePassword). Logout/LogoutAll clear cookies (`MaxAge=-1`).
+  GetMe wraps in `{"data":{...}}` envelope. Both MeHandler methods read claims via
+  `middleware.AuthClaims(r)`.
+- **Middleware** (`internal/middleware/`):
+  - `auth.go` — `RequireAuth(jwtSecret)` (Bearer header → cookie fallback, JWT verify, claims injection) + `AuthClaims(r)`
+  - `cors.go` — `CORS(allowedOrigins)`: explicit allowlist, echoes origin (never `*`), `Vary: Origin`, preflight 204
+  - `securityheaders.go` — `SecurityHeaders(appEnv)`: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, `default-src 'none'` CSP, HSTS (production only)
+  - `ratelimit/ratelimit.go` — `New(limit, window)`: returns per-IP fixed-window middleware; each call creates its own isolated counter store
+- **Router** (`internal/router/router.go`): `SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler` — creates all rate limiters, wires per-route middleware chains, wraps mux in global security headers + CORS middleware, returns the assembled handler.
+- **JWT tokens**: `internal/utils/jwttoken` — HS256, 15-min lifetime, claims:
+  UserID/SessionID/PlanKey. `Issue` + `Verify` (rejects expired, wrong key, alg:none).
+- **Routes** (all wired in `internal/router/router.go`, global middleware: security headers + CORS):
+  - `GET /health` — public, no rate limit
+  - `POST /api/v1/auth/register` — 5/hour rate limit
+  - `POST /api/v1/auth/login` — 10/15min rate limit
+  - `POST /api/v1/auth/refresh` — 60/15min rate limit
+  - `POST /api/v1/auth/logout` — 10/15min rate limit + RequireAuth
+  - `POST /api/v1/auth/logout-all` — 5/15min rate limit + RequireAuth
+  - `GET /api/v1/me` — 60/15min rate limit + RequireAuth
+  - `POST /api/v1/me/password/change` — 5/15min rate limit + RequireAuth
+- **Tests** (under root `test/`, per §3.9/Q6):
+  - `test/service` — Register (success/email-exists/invalid-input), Login (success/4 invalid paths), Refresh (success/reuse/expired), Logout, LogoutAll, GetMe (success/not-found), ChangePassword (success/invalid-creds/oauth-only/weak-password)
+  - `test/handlers` — Register/Login/Refresh/Logout/LogoutAll/GetMe/ChangePassword (happy paths + key error paths)
+  - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer), AuthClaims outside protected route
+  - `test/jwttoken` — Issue/Verify roundtrip, wrong key, tampered, malformed, alg:none, duration constant, distinct tokens
+  - `test/hash`, `test/token`, `test/validate`
+- **Helpers**: `pkg/dotenv`, `pkg/hash` (Argon2id PHC), `utils/token` (opaque token + SHA-256),
+  `utils/validate`, `utils/response` (envelope, codes, `errorStatusMap`, `HandleError`),
+  `utils/jwttoken`, `msgs` sentinel errors.
 
 ### Not yet implemented (from the specs)
 
-- Login, refresh/rotation, logout, current-user endpoint
 - Email verification, password reset, email change
 - Google OAuth / account linking
-- Authentication/authorization/rate-limit middleware, request IDs, security headers
-- Wiring the managers into `main.go` (route registration)
-- Tests (first ones will be mandated by the feature specs)
+- Audit events (`audit_events` table exists; nothing writes to it yet)
+- Account deletion
 - Everything in `plans_and_entitlements_v1_backend_spec.md` beyond the plan
   model and free-subscription-on-register behavior
-- Git history: **no commits exist yet** (branch `master`, all files untracked)
 
-### Suggested next step
+### Suggested next steps (in order of priority)
 
-Implement **login** (`authentication_v1_backend_spec.md` §8) using the §8
-walkthrough above; then the token/session architecture (§9, §11) and middleware
-(§21–23) needed to protect the API.
+1. **Email infrastructure** — `EmailSender` interface + dev implementation (noop or local SMTP); required before email verification and password reset can be completed
+2. **Email verification** + **Password reset** — both need the email sender; tackle together since they share the same token-generation + email-sending infrastructure
+3. **Google OAuth** — large feature; requires OAuth provider abstraction and new routes
+4. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
 
 ---
 
@@ -606,7 +705,8 @@ Before declaring any task done, verify **all** of:
 - [ ] `gofmt` clean on changed files
 - [ ] `go vet ./...` passes
 - [ ] `go build ./...` passes
-- [ ] Tests written per the feature spec; suite passes (where tests exist)
+- [ ] Tests written per the feature spec, placed under root `test/` mirroring
+      the package under test (Q6, §3.9) — not colocated beside source; suite passes
 - [ ] Dependencies follow the layer rules (A1); no upward/skipping imports
 - [ ] Pattern conforms to the existing manager/interface structure (A2)
 - [ ] No new dependency added without asking (F2)

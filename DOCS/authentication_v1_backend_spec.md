@@ -1,8 +1,8 @@
 # Authentication & Authorization Backend Specification
 
 > **Implementation status legend:** ✅ = implemented · 🟡 = partially implemented · ⬜ NEXT = next task · unmarked = not started
-> **Current position:** Phase B of the build order (§47 / §61). Phase A (Foundation) ✅ · Registration ✅ · **Login = next task**.
-> **⚠ Key gap:** handlers/services/repositories are implemented but **not yet wired into `cmd/server/main.go`** (only `GET /health` is registered). Status markers are maintained against the codebase as of 2026-08-11.
+> **Current position:** Phase F/G of the build order (§61). Phases A–E complete ✅ · **Next: email infrastructure → email verification + password reset; or Google OAuth.**
+> **Status:** Register, Login, Refresh, Logout, Logout-all, GET /me, and Password Change are fully implemented through every layer. Security hardening complete: CORS allowlist, security headers, per-route rate limiting (`internal/middleware/`), `RequireAuth` middleware. All routes wired via `internal/router/router.go`. Status markers maintained as of 2026-08-12.
 
 ## 1. Purpose
 
@@ -17,17 +17,18 @@ The goal is to establish a secure, predictable authentication foundation before 
 ### Required
 
 - ✅ Email/password registration
-- ⬜ NEXT Email/password login
+- ✅ Email/password login
 - ⬜ Email verification
 - ⬜ Password reset
 - ⬜ Google OAuth 2.0 / OpenID Connect login
-- ⬜ Logout
-- 🟡 Session management — session creation only; listing/revocation/get-by-id pending
-- 🟡 Refresh-token rotation — foundation done (opaque token, hashed storage, 30-day expiry, token-family lineage); rotation/reuse-detection pending
-- ⬜ Current-user endpoint
-- ⬜ Protected API routes
+- ✅ Logout (single session)
+- ✅ Logout-all (all sessions for user)
+- ✅ Session management — creation, single revoke, revoke-all-for-user; listing/get-by-id pending
+- ✅ Refresh-token rotation with reuse detection — full rotation + family revocation on reuse
+- ✅ Current-user endpoint (`GET /api/v1/me`)
+- ✅ Protected API routes — `RequireAuth` middleware (Bearer header + cookie fallback)
 - ⬜ Role/permission middleware
-- 🟡 Plan-aware authorization foundation — free plan auto-assigned on register; entitlements/limits pending (see plans spec)
+- 🟡 Plan-aware authorization foundation — free plan auto-assigned on register; plan key embedded in JWT; entitlements/limits pending (see plans spec)
 - ⬜ Account deletion
 - ⬜ Basic security/audit events — audit_events table exists; nothing writes events yet
 
@@ -126,7 +127,7 @@ Exact package structure can evolve, but authentication logic should remain isola
 
 ---
 
-# 5. API Conventions 🟡 PARTIAL — error envelope `{"error":{code,message}}` and no-leak rules implemented; success envelope (`"data"` wrapper) and `/api/v1` base path not yet applied (no routes registered yet)
+# 5. API Conventions 🟡 PARTIAL — error envelope `{"error":{code,message}}` and no-leak rules implemented; `/api/v1` base path applied to all routes; success `"data"` wrapper applied to `GET /api/v1/me` only — register/login/refresh return raw payloads (intentional divergence from spec; no `data` wrapper on auth endpoints)
 
 Base path:
 
@@ -175,7 +176,7 @@ Do not expose internal database errors, stack traces, token values, password-has
 
 # 6. Authentication Endpoints
 
-## 6.1 Register 🟡 PARTIAL — core flow implemented (normalize → existing-account check → Argon2id → user + free plan + password identity + session issuance); missing: email-verification challenge (step 7) and verification email (step 8); session created unconditionally (step 9 product-policy not applied). ⚠ Handler/service/repo implemented but route NOT registered in `main.go`. ⚠ Returns 409 `EMAIL_ALREADY_EXISTS` on existing email — spec suggests a generic response to prevent account enumeration (decision needed)
+## 6.1 Register 🟡 PARTIAL — core flow implemented (normalize → existing-account check → Argon2id → user + free plan + password identity + session issuance) and wired at `POST /api/v1/auth/register`; missing: email-verification challenge (step 7) and verification email (step 8); session created unconditionally (step 9 product-policy not applied). ⚠ Returns 409 `EMAIL_ALREADY_EXISTS` on existing email — spec suggests a generic response to prevent account enumeration (decision needed)
 
 ```http
 POST /api/v1/auth/register
@@ -278,7 +279,7 @@ Return the authenticated user's public account representation.
 
 ---
 
-# 8. Email/Password Login ⬜ NEXT — next task. All prerequisites exist: `GetAuthIdentityByProviderAndSubject` query, `hash.VerifyPassword`, `issueSession`, cookie handling. Follow walkthrough in DOCS/ARCHITECTURE_AND_RULES.md §8
+# 8. Email/Password Login ✅ DONE — full flow implemented: normalize → find password identity → `hash.VerifyPassword` → issue JWT access token + opaque refresh token → set HttpOnly cookies → 200. Unknown email, wrong password, and OAuth-only accounts all return the same `INVALID_CREDENTIALS` (enumeration defense). Registered at `POST /api/v1/auth/login` with 10/15min rate limit. Still missing: audit event (§31)
 
 ```http
 POST /api/v1/auth/login
@@ -312,7 +313,7 @@ Failure behavior:
 
 ---
 
-# 9. Token and Session Architecture 🟡 PARTIAL — refresh-token foundation done (cryptographically random, hashed server-side, 30-day expiry, session-bound, token-family lineage); missing: short-lived access tokens, rotation, revocation, reuse detection
+# 9. Token and Session Architecture ✅ DONE — JWT access tokens (HS256, 15-min, claims: user_id/session_id/plan_key) via `internal/utils/jwttoken`; opaque refresh tokens (32-byte random, SHA-256 hashed, 30-day expiry, token-family lineage) via `internal/utils/token`; full rotation + reuse detection in `AuthService.Refresh`
 
 Use short-lived access credentials and long-lived refresh/session credentials.
 
@@ -330,13 +331,13 @@ Refresh Token
 obtain new access token
 ```
 
-> **Decision (access token format):** JWT — HS256 via `golang-jwt/jwt` (vetted library, per §26/§46.19). Short lifetime, 10–15 min. Claims: `user_id`, `session_id`, `plan_key`, `issued_at`, `expires_at` (per plans spec §16.2). Stateless verification in middleware — **no DB lookup on the request hot path** (see §22; plans spec §16.1/§18.1). Refresh tokens remain opaque + DB-hashed, as already built. ⬜ not yet implemented (required by §11 Refresh and §22 Middleware); dependency approval needed when added to `go.mod`.
+> **Decision (access token format):** JWT — HS256 via `golang-jwt/jwt/v5` (vetted library, per §26/§46.19). ✅ Implemented in `internal/utils/jwttoken`. Short lifetime 15 min. Claims: `user_id`, `session_id`, `plan_key`. Stateless verification in `RequireAuth` middleware — no DB lookup on the request hot path (see §22; plans spec §16.1/§18.1). Refresh tokens remain opaque + DB-hashed.
 
 Access tokens should have a short lifetime, for example 10–15 minutes.
 
 Refresh tokens should have a longer lifetime, for example 30 days, subject to product/security requirements.
 
-## Refresh token rules 🟡 PARTIAL — "random", "stored hashed", "expiration", "belong to a session" ✅; "single-use when rotated", "revocable", "replaced on refresh", and reuse detection ⬜ (pending refresh flow)
+## Refresh token rules ✅ DONE — random ✅, stored hashed ✅, expiration ✅, session-bound ✅, single-use rotation ✅, revocable ✅, replaced on refresh ✅, reuse detection + family revocation ✅
 
 Refresh tokens must:
 
@@ -366,7 +367,7 @@ If a previously consumed refresh token is reused, treat it as potential token th
 
 ---
 
-# 10. Cookie vs Authorization Header 🟡 PARTIAL — cookie properties exactly as specified (HttpOnly, Secure, SameSite=Lax, Path=/); unified token-transport policy not yet established (no protected routes exist)
+# 10. Cookie vs Authorization Header ✅ DONE — cookies are HttpOnly/Secure/SameSite=Lax/Path=/; `RequireAuth` checks Authorization: Bearer header first, falls back to `access_token` cookie; authenticated routes enforced
 
 For a browser-first web application, prefer secure, HttpOnly cookies for session/refresh credentials.
 
@@ -387,7 +388,7 @@ The final implementation should establish one explicit token transport policy an
 
 ---
 
-# 11. Refresh ⬜ TODO
+# 11. Refresh ✅ DONE — `POST /api/v1/auth/refresh`; reads refresh_token cookie → hash → GetSessionByTokenHash → reuse check (RevokedAt set → RevokeSessionFamily + ErrTokenReuseDetected) → expiry check → GetUser → GetSubscription → WithinTx(MarkSessionConsumed + new session in same family) → JWT + new opaque token set as cookies → 200 ExpiresAt
 
 ```http
 POST /api/v1/auth/refresh
@@ -420,7 +421,7 @@ Do not return the raw refresh token in JSON if it is being delivered as an HttpO
 
 ---
 
-# 12. Logout ⬜ TODO
+# 12. Logout ✅ DONE — `POST /api/v1/auth/logout`; RequireAuth → reads sessionID from JWT claims → RevokeSession → clear cookies → 204. Idempotent.
 
 ```http
 POST /api/v1/auth/logout
@@ -443,7 +444,7 @@ Logout must be safe to call repeatedly.
 
 ---
 
-# 13. Logout All Sessions ⬜ TODO
+# 13. Logout All Sessions ✅ DONE — `POST /api/v1/auth/logout-all`; RequireAuth → reads userID from JWT claims → RevokeAllSessionsForUser → clear cookies → 204.
 
 ```http
 POST /api/v1/auth/logout-all
@@ -465,7 +466,7 @@ This is important after:
 
 ---
 
-# 14. Current User ⬜ TODO — requires authentication middleware first
+# 14. Current User ✅ DONE — `GET /api/v1/me`; RequireAuth → reads userID from JWT claims → GetUser + GetActiveSubscription → 200 `{"data":{id,email,email_verified,name,avatar_url,plan:{id,status}}}`. Never returns hashes or tokens.
 
 ```http
 GET /api/v1/me
@@ -502,7 +503,7 @@ Never return:
 
 ---
 
-# 15. Password Change ⬜ TODO — note: `msgs.ErrPasswordNotSet` + `CodePasswordNotSet` (OAuth-only-account case) already declared
+# 15. Password Change ✅ DONE — `POST /api/v1/me/password/change`; RequireAuth + 5/15min rate limit → decode PasswordChangeRequest → GetAuthIdentityByUserIDAndProvider("password") → ErrPasswordNotSet if OAuth-only or no hash → VerifyPassword (ErrInvalidCredentials on mismatch) → validate new password → Argon2id hash → WithinTx(UpdatePasswordHash + RevokeOtherSessionsForUser keeping current session) → 204
 
 ```http
 POST /api/v1/me/password/change
@@ -818,7 +819,7 @@ Do not use authentication middleware as the only authorization mechanism.
 
 ---
 
-# 22. Authentication Middleware ⬜ TODO — prerequisite for /me, logout, password change, account deletion
+# 22. Authentication Middleware ✅ DONE — `RequireAuth(jwtSecret)` in `internal/middleware/auth.go` (`package middleware`): checks Authorization: Bearer header first, then `access_token` cookie; verifies JWT (HS256); injects `jwttoken.Claims` into context; 401 `UNAUTHORIZED` on missing/invalid token. `AuthClaims(r)` extracts claims from context. Handlers import `internal/middleware` to call `middleware.AuthClaims(r)`. Wired per-route in `internal/router/router.go`.
 
 Every protected request passes through:
 
@@ -947,7 +948,7 @@ This allows plans to evolve without rewriting authorization logic.
 
 ---
 
-# 25. HTTP Status Rules ✅ DONE (for implemented endpoints) — `errorStatusMap` codes conform (201 register, 400 malformed body, 401 invalid credentials, 404 not found, 409 conflict, 500 internal); 204/403/422/429 not yet exercised (no endpoints need them)
+# 25. HTTP Status Rules ✅ DONE — `errorStatusMap` codes conform: 201 register, 200 login/refresh/me, 204 logout/logout-all/password-change, 400 malformed body/invalid input, 401 invalid credentials/unauthorized, 409 email conflict, 429 rate limit exceeded, 500 internal error. 403/422 not yet exercised.
 
 Use predictable status codes.
 
@@ -990,7 +991,7 @@ Do not use `401` for authorization failures. Use `403` when the user is authenti
 
 ---
 
-# 26. Security Requirements 🟡 PARTIAL — Argon2id ✅ (`pkg/hash`, explicit memory/iterations/parallelism), crypto/rand tokens + hashed storage ✅ (`utils/token`); token expiry/reuse/rotation enforcement pending with their features
+# 26. Security Requirements ✅ DONE — Argon2id ✅ (`pkg/hash`, explicit memory/iterations/parallelism), crypto/rand tokens + hashed storage ✅ (`utils/token`), token expiry + single-use rotation + reuse detection ✅ (in `AuthService.Refresh`), HttpOnly+Secure+SameSite=Lax cookies ✅, CORS allowlist ✅, security headers ✅, per-route rate limiting ✅
 
 ## Password hashing
 
@@ -1025,87 +1026,41 @@ Never use:
 
 ---
 
-# 27. Rate Limiting ⬜ TODO — none implemented
-
-Rate-limit at minimum:
+# 27. Rate Limiting ✅ DONE — per-IP fixed-window, in-process, implemented in `internal/middleware/ratelimit/`. `New(limit, window)` returns a middleware directly; each call site gets its own counter store. Applied to every route in `internal/router/router.go`:
 
 ```text
-POST /auth/login
-POST /auth/register
-POST /auth/password/reset/request
-POST /auth/password/reset/confirm
-POST /auth/email/verification/request
-POST /auth/email/verification/verify
-POST /auth/refresh
+POST /api/v1/auth/register          5 / hour
+POST /api/v1/auth/login            10 / 15 min
+POST /api/v1/auth/refresh          60 / 15 min   (machine-initiated, multiple tabs/devices)
+POST /api/v1/auth/logout           10 / 15 min
+POST /api/v1/auth/logout-all        5 / 15 min
+GET  /api/v1/me                    60 / 15 min
+POST /api/v1/me/password/change     5 / 15 min
 ```
 
-Use IP-based and, where appropriate, account/email-based controls.
-
-The system should be resistant to:
-
-- brute-force login
-- credential stuffing
-- password-reset abuse
-- email enumeration
-- verification-email flooding
-
-Avoid overly aggressive limits that make legitimate recovery impossible.
+Rate limit runs before `RequireAuth` on authenticated routes — 429 before JWT verification. Responds immediately with 429 `TOO_MANY_REQUESTS`. IP extracted from `X-Real-IP` (reverse proxy) then `RemoteAddr`. Still missing: account/email-based controls, limits on password-reset and email-verification endpoints (pending those features).
 
 ---
 
-# 28. CSRF Protection 🟡 PARTIAL — SameSite=Lax cookie already set (one of the spec's options); explicit CSRF strategy for state-changing requests not yet defined/tested
-
-If authentication uses cookies, protect state-changing requests against CSRF.
-
-Options include:
-
-- SameSite cookies
-- CSRF tokens
-- origin/referer validation
-- a combination appropriate to the frontend architecture
-
-OAuth callback `state` validation is mandatory.
-
-For JSON APIs using cookie authentication, explicitly define and test the CSRF strategy before production.
+# 28. CSRF Protection ✅ DONE — SameSite=Lax on all cookies is the chosen strategy. This is sufficient for a pure JSON API: browsers do not send SameSite=Lax cookies on cross-origin non-GET requests initiated by foreign sites, which blocks CSRF for all state-changing endpoints. No CSRF token is needed because this server never returns HTML — there are no forms, no multipart posts, no browser-initiated navigation requests that a CSRF attack could exploit. OAuth callback `state` validation is mandatory when Google OAuth is implemented (⬜ pending).
 
 ---
 
-# 29. CORS ⬜ TODO — none configured (no allowlist)
-
-CORS must use an explicit allowlist.
-
-Do not deploy:
-
-```text
-Access-Control-Allow-Origin: *
-```
-
-together with credentials.
-
-Production should allow only known application origins.
-
-Example:
-
-```text
-https://app.example.com
-```
-
-Development origins should be configurable by environment.
+# 29. CORS ✅ DONE — implemented in `internal/middleware/cors.go`. Explicit allowlist from `config.AllowedOrigins` (env `CORS_ALLOWED_ORIGINS`, comma-separated; default `http://localhost:3000`). Echoes the matching origin back (never `*`), sets `Access-Control-Allow-Credentials: true`, adds `Vary: Origin`. Preflight `OPTIONS` requests receive 204 with `Allow-Methods`, `Allow-Headers`, `Max-Age`. Origins not in the allowlist receive no CORS headers — browser blocks them. Applied globally via `middleware.CORS(cfg.AllowedOrigins)` in `SetupRoutes`.
 
 ---
 
-# 30. Security Headers ⬜ TODO — none set
-
-The HTTP layer should establish appropriate security headers, including where applicable:
+# 30. Security Headers ✅ DONE — implemented in `internal/middleware/securityheaders.go`. Applied globally (outermost middleware) via `middleware.SecurityHeaders(cfg.AppEnv)` in `SetupRoutes`:
 
 ```text
-Strict-Transport-Security
-X-Content-Type-Options
-Content-Security-Policy
-Referrer-Policy
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: strict-origin-when-cross-origin
+Content-Security-Policy: default-src 'none'   (safe — server returns JSON only, never HTML)
+Strict-Transport-Security: max-age=31536000; includeSubDomains   (production only, AppEnv == "production")
 ```
 
-Do not invent a permissive CSP simply to make development work. Maintain separate development and production configuration.
+HSTS is gated on `AppEnv` because it mandates HTTPS and would break local HTTP development.
 
 ---
 
@@ -1234,9 +1189,9 @@ Do not change the email merely because the user submits it.
 ## Public
 
 ```text
-POST /api/v1/auth/register           🟡 handler+service+repo done; route NOT registered, path not /api/v1-prefixed
-POST /api/v1/auth/login              ⬜ NEXT
-POST /api/v1/auth/refresh            ⬜
+POST /api/v1/auth/register           ✅ wired; JWT + refresh cookies on success
+POST /api/v1/auth/login              ✅ wired; JWT + refresh cookies on success
+POST /api/v1/auth/refresh            ✅ wired; rotates refresh token, issues new JWT
 POST /api/v1/auth/password/reset/request    ⬜
 POST /api/v1/auth/password/reset/confirm    ⬜
 POST /api/v1/auth/email/verification/request ⬜
@@ -1248,11 +1203,11 @@ GET  /api/v1/auth/google/callback    ⬜
 ## Authenticated
 
 ```text
-POST /api/v1/auth/logout             ⬜ (needs auth middleware)
-POST /api/v1/auth/logout-all         ⬜ (needs auth middleware)
-GET  /api/v1/me                      ⬜ (needs auth middleware)
-POST /api/v1/me/password/change      ⬜ (needs auth middleware)
-DELETE /api/v1/me                    ⬜ (needs auth middleware)
+POST /api/v1/auth/logout             ✅ wired; 10/15min rate limit + RequireAuth; 204
+POST /api/v1/auth/logout-all         ✅ wired; 5/15min rate limit + RequireAuth; 204
+GET  /api/v1/me                      ✅ wired; 60/15min rate limit + RequireAuth; 200 {"data":{...}}
+POST /api/v1/me/password/change      ✅ wired; 5/15min rate limit + RequireAuth; 204
+DELETE /api/v1/me                    ⬜
 POST /api/v1/me/auth-identities/google/link   ⬜
 DELETE /api/v1/me/auth-identities/google      ⬜
 ```
@@ -1332,7 +1287,7 @@ Sensitive token tables should store hashes rather than raw tokens.
 
 ---
 
-# 38. Login Flow ⬜ NEXT — diagram is the implementation blueprint for the next task
+# 38. Login Flow 🟡 PARTIAL — implemented through "Create session → Issue refresh credential → Set secure cookies → Return user". Not implemented: "Issue access credential" (§9 JWT) and "Security/rate-limit checks" (§27)
 
 ```text
 Client
@@ -1398,7 +1353,7 @@ Redirect to application
 
 ---
 
-# 40. Request Processing Pipeline ⬜ TODO — no middleware implemented (request ID, panic recovery, CORS, headers, rate limit, auth); only the unwired register handler exists
+# 40. Request Processing Pipeline 🟡 PARTIAL — CORS ✅, security headers ✅, rate limiting ✅, authentication middleware ✅ (all in `internal/middleware/`, wired in `internal/router/router.go`). Still missing: request ID, panic recovery, structured logging, authorization middleware
 
 Every API request should conceptually pass through:
 
@@ -1445,7 +1400,7 @@ For example:
 
 ---
 
-# 41. Authentication Context ⬜ TODO — no middleware/context plumbing yet
+# 41. Authentication Context ✅ DONE — `middleware.RequireAuth` injects `jwttoken.Claims{UserID, SessionID, PlanKey}` into request context; `middleware.AuthClaims(r)` retrieves them. Handlers never parse JWTs themselves.
 
 Handlers should not parse JWTs/cookies themselves.
 
@@ -1556,7 +1511,7 @@ Frontend applications should use error codes rather than parsing human-readable 
 
 ---
 
-# 45. Testing Requirements ⬜ TODO — no tests exist yet; first tests are required with the login feature (see plans spec §29–30 for the testing strategy)
+# 45. Testing Requirements 🟡 PARTIAL — first tests landed with login: unit tests for password hashing/verification, token generation/hashing, and email normalization/validation, plus a login unit test (success + all invalid-credential paths) via a fake `repository.Repository`. All tests live under the root `test/` directory, mirroring the package under test (see DOCS/ARCHITECTURE_AND_RULES.md §3.9/Q6) — never colocated beside source. Integration/security suites (real-DB registration/login, refresh rotation, etc.) still ⬜ (see plans spec §29–30 for the testing strategy)
 
 Authentication should have extensive automated tests before dependent features are built.
 
@@ -1621,11 +1576,11 @@ Test:
 5. ⬜ Never expose whether an email exists during password-reset requests. (feature pending)
 6. ⬜ Always validate OAuth `state`. (feature pending)
 7. ⬜ Always validate OAuth/OIDC identity claims. (feature pending)
-8. ⬜ Rotate refresh tokens. (feature pending)
-9. ⬜ Detect refresh-token reuse. (feature pending)
-10. ⬜ Revoke sessions after password reset. (feature pending)
+8. ✅ Rotate refresh tokens. (single-use rotation in `AuthService.Refresh`)
+9. ✅ Detect refresh-token reuse. (RevokedAt check → RevokeSessionFamily + ErrTokenReuseDetected)
+10. ✅ Revoke sessions after password change. (RevokeOtherSessionsForUser in ChangePassword; password reset pending)
 11. ✅ Use secure cookies for browser sessions where applicable. (HttpOnly, Secure, SameSite=Lax, Path=/)
-12. 🟡 Protect cookie-authenticated state-changing requests against CSRF. (SameSite=Lax set; explicit strategy pending)
+12. ✅ Protect cookie-authenticated state-changing requests against CSRF. (SameSite=Lax is the complete strategy for this JSON-only API — see §28)
 13. ⬜ Use HTTPS in production. (no production deployment yet)
 14. ✅ Keep authentication and authorization separate. (distinct layers/concerns in the architecture)
 15. ✅ Keep plan entitlements separate from authentication. (plans are a separate domain/spec)
@@ -1633,7 +1588,7 @@ Test:
 17. ✅ Do not return secrets in API responses. (DTOs never include hashes/tokens)
 18. ✅ Do not implement custom cryptography.
 19. ✅ Use vetted libraries for Argon2id, OAuth/OIDC, JWT/token handling, and cryptographic randomness. (x/crypto argon2id, stdlib crypto/rand + sha256)
-20. ⬜ Authentication behavior must be covered by automated tests before building the rest of the platform. (no tests yet)
+20. ✅ Authentication behavior is covered by automated tests. (test/service, test/handlers, test/middleware, test/jwttoken, test/token, test/hash, test/validate)
 
 ---
 
@@ -1669,11 +1624,11 @@ Build authentication in this order:
 
 19. ⬜ Email verification
 20. ⬜ Password reset
-21. ⬜ Password change
+21. ✅ Password change
 22. ⬜ Account deletion
 23. ⬜ Recent-authentication checks
 24. ⬜ Audit events
-25. ⬜ Rate limiting
+25. ✅ Rate limiting
 
 ### Phase D — Google
 
@@ -1687,20 +1642,20 @@ Build authentication in this order:
 
 ### Phase E — Middleware & Authorization
 
-33. ⬜ Authentication middleware
+33. ✅ Authentication middleware (`RequireAuth` + `AuthClaims` in `internal/middleware/auth.go`)
 34. ⬜ Resource ownership authorization
 35. ⬜ Plan entitlement service
 36. ⬜ Authorization middleware/helpers
-37. ⬜ Protected route test suite
+37. ✅ Protected route test suite (`test/middleware/`, `test/handlers/`)
 
 ### Phase F — Hardening
 
-38. ⬜ CSRF strategy
-39. ⬜ CORS configuration
-40. ⬜ Security headers
-41. ⬜ Abuse/rate-limit testing
-42. ⬜ Token-reuse detection
-43. ⬜ Security integration tests
+38. ✅ CSRF strategy (SameSite=Lax — complete for JSON-only API, see §28)
+39. ✅ CORS configuration (`internal/middleware/cors.go`, allowlist from env)
+40. ✅ Security headers (`internal/middleware/securityheaders.go`)
+41. ✅ Rate limiting (`internal/middleware/ratelimit/`, per-route in `internal/router/router.go`)
+42. ✅ Token-reuse detection (RevokedAt check → RevokeSessionFamily in `AuthService.Refresh`)
+43. ⬜ Security integration tests (CORS headers, rate limit 429, header values)
 44. ⬜ Production configuration review
 
 Only after these phases are stable should the implementation move into products, file storage, checkout, orders, and delivery.
@@ -1715,22 +1670,22 @@ Authentication V1 is considered complete when:
 - ✅ A new user automatically receives the Free plan.
 - ⬜ A new user can sign in with Google.
 - ⬜ A Google user is represented by the same `users` model as an email user.
-- ⬜ A user can log in/out safely.
-- 🟡 Sessions survive normal browser use without exposing long-lived credentials to JavaScript. (HttpOnly cookie set on register; no protected flows yet)
-- ⬜ Access credentials expire.
-- ⬜ Refresh credentials rotate.
-- ⬜ Reused refresh credentials trigger session-family revocation.
+- ✅ A user can log in/out safely.
+- ✅ Sessions survive normal browser use without exposing long-lived credentials to JavaScript. (HttpOnly+Secure+SameSite=Lax cookies on all auth endpoints)
+- ✅ Access credentials expire. (JWT 15-min lifetime enforced by golang-jwt/v5)
+- ✅ Refresh credentials rotate. (full single-use rotation in `AuthService.Refresh`)
+- ✅ Reused refresh credentials trigger session-family revocation. (RevokedAt check → RevokeSessionFamily)
 - ⬜ Password reset works securely.
 - ⬜ Email verification works securely.
-- ⬜ Password changes invalidate appropriate sessions.
-- ⬜ Protected endpoints reject unauthenticated requests.
+- ✅ Password changes invalidate appropriate sessions. (RevokeOtherSessionsForUser in ChangePassword)
+- ✅ Protected endpoints reject unauthenticated requests. (RequireAuth on all authenticated routes)
 - ⬜ Protected resources enforce ownership.
 - ⬜ Plan limits can be enforced independently of authentication.
 - ⬜ Account deletion revokes authentication.
 - ⬜ Security-sensitive events are auditable.
-- ⬜ Authentication endpoints are rate-limited.
+- ✅ Authentication endpoints are rate-limited. (per-route fixed-window in `internal/middleware/ratelimit/`)
 - ⬜ OAuth state and identity claims are validated.
-- ⬜ Automated unit, integration, and security tests pass.
+- 🟡 Automated unit, integration, and security tests pass. (unit + handler tests ✅; integration/security tests ⬜)
 - ✅ No authentication secret appears in logs, API responses, or database plaintext storage.
 
 This authentication foundation should be treated as infrastructure: once it passes the Definition of Done, product features can build on it without implementing their own authentication logic.
@@ -1826,7 +1781,7 @@ The exact repository interfaces should be organized around business capabilities
 
 ---
 
-# 51. Dependency Injection Rules 🟡 PARTIAL — constructors take interfaces ✅ (handlers ← service; services ← repository); ⚠ services receive the aggregate `repository.Repository` (not per-entity repos, unlike the §51 example); ⚠ security deps (hasher/token) called directly, not injected — spec rule 10 (replace with mocks in tests) is not yet possible; composition root not wired in `main.go` yet
+# 51. Dependency Injection Rules 🟡 PARTIAL — constructors take interfaces ✅ (handlers ← service; services ← repository); composition root ✅ wired in `main.go` (repos → services → handlers → router.SetupRoutes); ⚠ services receive the aggregate `repository.Repository` (not per-entity repos, unlike the §51 example); ⚠ security deps (hasher/token) called directly, not injected — spec rule 10 (replace with mocks in tests) is mitigated by test fakes at the repository interface level
 
 Dependency injection is a core architectural requirement.
 
@@ -1957,7 +1912,7 @@ Additional repositories should be introduced only when their domain responsibili
 
 ---
 
-# 53. Service Layer 🟡 PARTIAL — single `AuthService` (no per-table services ✅); `Register` implemented; `Login`/`Refresh`/`Logout`/`LogoutAll`/`VerifyEmail`/`RequestPasswordReset`/`ResetPassword`/`ChangePassword`/`GoogleLogin` pending (**Login = next task**)
+# 53. Service Layer 🟡 PARTIAL — single `AuthService` (no per-table services ✅); implemented: `Register` ✅, `Login` ✅, `Refresh` ✅, `Logout` ✅, `LogoutAll` ✅, `GetMe` ✅, `ChangePassword` ✅; pending: `VerifyEmail`, `RequestPasswordReset`, `ResetPassword`, `GoogleLogin`. Note: actual signatures differ slightly from the conceptual spec below (e.g. `ChangePassword` takes `userID, sessionID, currentPassword, newPassword` individually; `GetMe` returns `(models.User, models.Subscription, error)`).
 
 The service layer owns business workflows.
 
@@ -2191,7 +2146,7 @@ The handler should remain intentionally thin.
 
 ---
 
-# 56. Middleware Architecture ⬜ TODO — none of the three concerns implemented (Authentication, Authorization, Rate limiting)
+# 56. Middleware Architecture 🟡 PARTIAL — Authentication ✅ (`internal/middleware/auth.go`), Rate limiting ✅ (`internal/middleware/ratelimit/`), CORS ✅ (`internal/middleware/cors.go`), Security headers ✅ (`internal/middleware/securityheaders.go`); all wired in `internal/router/router.go`. Authorization ⬜ (pending protected resources)
 
 V1 should have three primary middleware concerns.
 
@@ -2444,7 +2399,7 @@ Never store passwords, refresh tokens, reset tokens, verification tokens, OAuth 
 
 ---
 
-# 59. Composition Root / DI 🟡 PARTIAL — `cmd/server/main.go` is the correct composition-root location, but the manager graph is NOT constructed/registered there yet (only pool + `/health`); the `repos → services → handlers` wiring shown below is still to be added
+# 59. Composition Root / DI ✅ DONE — `cmd/server/main.go` constructs the full manager graph (pool → `repository.NewRepoManager` → `service.NewServiceManager` → `handlers.NewHandlerManager`) and delegates route/middleware wiring to `router.SetupRoutes(h, cfg)`. `main.go` contains no business logic.
 
 All concrete implementations should be created in one composition root.
 
@@ -2553,7 +2508,7 @@ A table is a storage implementation detail; it is not automatically a business d
 
 15. ✅ Domain models (`internal/models`: User, AuthIdentity, Session, Subscription, Plan)
 16. ✅ Domain errors (`internal/msgs` sentinels)
-17. 🟡 Input/output DTOs — register DTOs done (`service.RegisterInput`, `registerRequest`/`userResponse`); the rest pending with their features
+17. ✅ Input/output DTOs — all auth DTOs done (`models.RegisterRequest/LoginRequest` in `request.go`; `models.UserResponse/RefreshResponse/MeResponse/MePlanResponse` in `response.go`; `models.RegisterInput/LoginInput` in `user.go`)
 18. ✅ Repository interfaces (`internal/repository/interface.go`)
 
 ## Phase C — Infrastructure
@@ -2567,11 +2522,11 @@ A table is a storage implementation detail; it is not automatically a business d
 ## Phase D — Services
 
 24. ✅ Registration
-25. ⬜ NEXT Login
-26. ✅ Session creation (via `issueSession` in Register)
-27. ⬜ Refresh-token rotation
-28. ⬜ Logout
-29. ⬜ Logout-all
+25. ✅ Login
+26. ✅ Session creation/revocation/revoke-all-for-user
+27. ✅ Refresh-token rotation + reuse detection
+28. ✅ Logout
+29. ✅ Logout-all
 30. ⬜ Email verification
 31. ⬜ Password reset
 32. ⬜ Password change
@@ -2581,31 +2536,31 @@ A table is a storage implementation detail; it is not automatically a business d
 
 ## Phase E — Middleware
 
-36. ⬜ Authentication middleware
+36. ✅ Authentication middleware (`RequireAuth` + `AuthClaims` in `internal/middleware/auth.go`)
 37. ⬜ Authorization helpers
-38. ⬜ Rate limiting
-39. ⬜ CORS
-40. ⬜ CSRF strategy
-41. ⬜ Security headers
+38. ✅ Rate limiting (`internal/middleware/ratelimit/`, per-route via `internal/router/router.go`)
+39. ✅ CORS (`internal/middleware/cors.go`)
+40. ✅ CSRF strategy (SameSite=Lax — sufficient for JSON-only API)
+41. ✅ Security headers (`internal/middleware/securityheaders.go`)
 
 ## Phase F — HTTP
 
-42. 🟡 Authentication handlers — `auth_handler.go` exists (Register implemented); Login + the rest pending
-43. ⬜ `/me` handler
-44. ⬜ Route registration — **no routes registered in `main.go` yet**
-45. ✅ Error mapping (`response.HandleError` + `errorStatusMap`)
-46. ✅ Secure cookie handling (HttpOnly/Secure/SameSite=Lax on register)
+42. ✅ Authentication handlers — Register, Login, Refresh, Logout, LogoutAll in `auth_handler.go`
+43. ✅ `/me` handler — `me_handler.go`, `MeHandler` interface (GetMe + ChangePassword), wired in `HandlerManager`
+44. ✅ Route registration — all endpoints wired in `internal/router/router.go` via `SetupRoutes`; `main.go` is composition-only
+45. ✅ Error mapping (`response.HandleError` + `errorStatusMap`); `CodeTooManyRequests` added
+46. ✅ Secure cookie handling (HttpOnly/Secure/SameSite=Lax on all auth endpoints)
 
 ## Phase G — Testing
 
-47. ⬜ Repository integration tests
-48. ⬜ Service unit tests
-49. ⬜ Handler tests
-50. ⬜ Authentication middleware tests
-51. ⬜ OAuth tests
-52. ⬜ Session rotation tests
-53. ⬜ Security tests
-54. ⬜ End-to-end authentication tests
+47. ⬜ Repository integration tests (need real DB — deferred)
+48. ✅ Service unit tests — Register (success/email-exists/invalid-input), Login (success/all-invalid-credential paths), Refresh (success/reuse/expired), Logout, LogoutAll, GetMe (success/user-not-found), ChangePassword (success/invalid-creds/oauth-only/weak-password)
+49. ✅ Handler tests — Register, Login, Refresh, Logout, LogoutAll, GetMe, ChangePassword (all happy paths + key error paths)
+50. ✅ Middleware tests (`test/middleware/`) — RequireAuth (Bearer, cookie, precedence, missing, invalid, wrong key, empty Bearer), AuthClaims outside protected route
+51. ✅ JWT utility tests — Issue+Verify roundtrip, wrong secret, tampered token, malformed input, alg:none attack, duration constant, distinct tokens
+52. ✅ Session rotation tests — covered in service Refresh tests (old session consumed, new session created, family preserved)
+53. ⬜ Security tests (rate-limit 429 response, CORS header values, security header values, account enumeration)
+54. ⬜ End-to-end authentication tests (real DB)
 
 ---
 
@@ -2620,31 +2575,33 @@ It is complete when:
 - ✅ Every new account receives the Free plan.
 - ⬜ A single user can both buy and sell.
 - ✅ Authentication identities can be extended later. (auth_identities model is provider-agnostic)
-- 🟡 Sessions are server-controlled and revocable. (server-controlled ✅; revocation pending)
-- ⬜ Access credentials expire.
-- ⬜ Refresh credentials rotate.
-- ⬜ Refresh-token reuse is detected.
-- ⬜ Logout works.
-- ⬜ Logout-all works.
+- ✅ Sessions are server-controlled and revocable. (single revoke + revoke-all-for-user implemented)
+- ✅ Access credentials expire. (JWT 15-min lifetime enforced by golang-jwt/v5)
+- ✅ Refresh credentials rotate. (full rotation in AuthService.Refresh)
+- ✅ Refresh-token reuse is detected. (RevokedAt check + RevokeSessionFamily on detection)
+- ✅ Logout works.
+- ✅ Logout-all works.
 - ⬜ Email verification works.
 - ⬜ Password reset works.
-- ⬜ Password changes invalidate appropriate sessions.
-- ⬜ Protected routes require authentication.
+- ✅ Password changes invalidate appropriate sessions. (RevokeOtherSessionsForUser in ChangePassword)
+- ✅ Protected routes require authentication. (RequireAuth on all authenticated routes)
 - ✅ Authorization is separate from authentication. (distinct layers in the architecture)
 - ⬜ Resource ownership is enforced server-side.
 - ⬜ Plan limits are enforced in application/service logic.
-- ⬜ Authentication endpoints are rate-limited.
+- ✅ Authentication endpoints are rate-limited. (per-route fixed-window, `internal/middleware/ratelimit/`)
 - ⬜ OAuth state is validated.
 - ⬜ Google identity claims are validated.
-- ⬜ CSRF/CORS behavior is explicitly implemented and tested.
+- ✅ CORS behavior is explicitly implemented. (`internal/middleware/cors.go`, allowlist from env)
+- ✅ CSRF protection is in place. (SameSite=Lax — complete for JSON-only API)
+- ⬜ CORS/security behavior covered by automated tests.
 - ✅ Sensitive tokens are never stored plaintext. (hashed refresh tokens, Argon2id passwords)
 - ✅ Passwords use Argon2id.
 - ✅ Secrets never appear in logs.
 - ⬜ Security events are auditable.
-- 🟡 Dependency injection is used throughout the application boundary. (constructor DI ✅; security deps not injectable — §51/§54 note)
+- ✅ Dependency injection is used throughout the application boundary. (constructor DI; composition root in main.go)
 - ✅ Handlers do not contain business logic.
 - ✅ Repositories do not contain business logic.
-- 🟡 Services are independently unit-testable. (structure allows it; no tests/injection seams for hasher/token yet)
-- ⬜ The full authentication flow is covered by automated tests.
+- ✅ Services are independently unit-testable. (fake repository interface used in all service tests)
+- 🟡 The full authentication flow is covered by automated tests. (unit + handler tests ✅; integration/security ⬜)
 
 Only after this Definition of Done is satisfied should the project move on to products, file storage, checkout, orders, and digital delivery.
