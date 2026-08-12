@@ -176,7 +176,7 @@ Do not expose internal database errors, stack traces, token values, password-has
 
 # 6. Authentication Endpoints
 
-## 6.1 Register 🟡 PARTIAL — core flow implemented (normalize → existing-account check → Argon2id → user + free plan + password identity + session issuance) and wired at `POST /api/v1/auth/register`; missing: email-verification challenge (step 7) and verification email (step 8); session created unconditionally (step 9 product-policy not applied). ⚠ Returns 409 `EMAIL_ALREADY_EXISTS` on existing email — spec suggests a generic response to prevent account enumeration (decision needed)
+## 6.1 Register 🟡 PARTIAL — core flow implemented (normalize → existing-account check → Argon2id → user + free plan + password identity + session issuance) and wired at `POST /api/v1/auth/register`; missing: email-verification challenge (step 7) and verification email (step 8); session created unconditionally (step 9 product-policy not applied). ⚠ Returns 409 `EMAIL_ALREADY_EXISTS` on existing email — spec suggests a generic response to prevent account enumeration (decision needed). Response is `models.AuthResponse` (id, email, name, expires_at).
 
 ```http
 POST /api/v1/auth/register
@@ -218,6 +218,17 @@ Recommended response:
 ```http
 201 Created
 ```
+
+```json
+{
+  "id": "uuid",
+  "email": "user@example.com",
+  "name": "Jane Doe",
+  "expires_at": "2026-08-12T10:15:00Z"
+}
+```
+
+`expires_at` is the expiry of the issued access token. Clients should use this to schedule a proactive background refresh timer immediately after registration, so the first silent refresh fires before the token lapses rather than waiting for a 401.
 
 Do not reveal whether a particular email is already registered in a way that enables account enumeration. If registration encounters an existing account, use a generic response where appropriate.
 
@@ -279,7 +290,7 @@ Return the authenticated user's public account representation.
 
 ---
 
-# 8. Email/Password Login ✅ DONE — full flow implemented: normalize → find password identity → `hash.VerifyPassword` → issue JWT access token + opaque refresh token → set HttpOnly cookies → 200. Unknown email, wrong password, and OAuth-only accounts all return the same `INVALID_CREDENTIALS` (enumeration defense). Registered at `POST /api/v1/auth/login` with 10/15min rate limit. Still missing: audit event (§31)
+# 8. Email/Password Login ✅ DONE — full flow implemented: normalize → find password identity → `hash.VerifyPassword` → issue JWT access token + opaque refresh token → set HttpOnly cookies → 200 `AuthResponse` (id, email, name, expires_at). Unknown email, wrong password, and OAuth-only accounts all return the same `INVALID_CREDENTIALS` (enumeration defense). Registered at `POST /api/v1/auth/login` with 10/15min rate limit. Still missing: audit event (§31)
 
 ```http
 POST /api/v1/auth/login
@@ -304,6 +315,19 @@ Behavior:
 6. Issue access token/session credentials.
 7. Rotate/replace any previous authentication state as required by policy.
 8. Record successful authentication event.
+
+Successful response:
+
+```json
+{
+  "id": "uuid",
+  "email": "user@example.com",
+  "name": "Jane Doe",
+  "expires_at": "2026-08-12T10:15:00Z"
+}
+```
+
+`expires_at` allows the client to start a background refresh timer immediately after login. See §11 for the same field on `POST /api/v1/auth/refresh`.
 
 Failure behavior:
 
@@ -2508,7 +2532,7 @@ A table is a storage implementation detail; it is not automatically a business d
 
 15. ✅ Domain models (`internal/models`: User, AuthIdentity, Session, Subscription, Plan)
 16. ✅ Domain errors (`internal/msgs` sentinels)
-17. ✅ Input/output DTOs — all auth DTOs done (`models.RegisterRequest/LoginRequest` in `request.go`; `models.UserResponse/RefreshResponse/MeResponse/MePlanResponse` in `response.go`; `models.RegisterInput/LoginInput` in `user.go`)
+17. ✅ Input/output DTOs — all auth DTOs done (`models.RegisterRequest/LoginRequest` in `request.go`; `models.AuthResponse/RefreshResponse/MeResponse/MePlanResponse` in `response.go`; `models.RegisterInput/LoginInput` in `user.go`). `AuthResponse` (id, email, name, expires_at) is returned by both Register and Login so clients can schedule a proactive background refresh immediately.
 18. ✅ Repository interfaces (`internal/repository/interface.go`)
 
 ## Phase C — Infrastructure

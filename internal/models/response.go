@@ -2,15 +2,19 @@ package models
 
 import "time"
 
-// UserResponse is the JSON body returned on a successful registration or login.
-type UserResponse struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
+// AuthResponse is the JSON body returned on a successful registration or login.
+// expires_at reports when the access token expires so clients can schedule a
+// proactive background refresh before the token lapses.
+type AuthResponse struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Name      string    `json:"name"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // RefreshResponse is the JSON body returned on a successful token refresh.
-// It reports when the new access token expires so clients know when to refresh.
+// It reports when the new access token expires so clients can reschedule
+// their background refresh timer.
 type RefreshResponse struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }

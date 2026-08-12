@@ -86,10 +86,11 @@ func (h *authHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setTokenCookies(w, pair)
-	response.JSON(w, http.StatusCreated, models.UserResponse{
-		ID:    user.ID.String(),
-		Email: user.Email,
-		Name:  user.Name,
+	response.JSON(w, http.StatusCreated, models.AuthResponse{
+		ID:        user.ID.String(),
+		Email:     user.Email,
+		Name:      user.Name,
+		ExpiresAt: time.Now().Add(jwttoken.AccessTokenDuration),
 	})
 }
 
@@ -116,10 +117,11 @@ func (h *authHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setTokenCookies(w, pair)
-	response.JSON(w, http.StatusOK, models.UserResponse{
-		ID:    user.ID.String(),
-		Email: user.Email,
-		Name:  user.Name,
+	response.JSON(w, http.StatusOK, models.AuthResponse{
+		ID:        user.ID.String(),
+		Email:     user.Email,
+		Name:      user.Name,
+		ExpiresAt: time.Now().Add(jwttoken.AccessTokenDuration),
 	})
 }
 

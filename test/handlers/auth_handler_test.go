@@ -149,17 +149,21 @@ func TestRegisterHandler_Success(t *testing.T) {
 		t.Fatalf("expected 201, got %d; body: %s", rec.Code, rec.Body)
 	}
 
-	type userBody struct {
-		ID    string `json:"id"`
-		Email string `json:"email"`
-		Name  string `json:"name"`
+	type authBody struct {
+		ID        string    `json:"id"`
+		Email     string    `json:"email"`
+		Name      string    `json:"name"`
+		ExpiresAt time.Time `json:"expires_at"`
 	}
-	body := decodeBody[userBody](t, rec)
+	body := decodeBody[authBody](t, rec)
 	if body.Email != user.Email {
 		t.Errorf("email: got %q, want %q", body.Email, user.Email)
 	}
 	if body.Name != user.Name {
 		t.Errorf("name: got %q, want %q", body.Name, user.Name)
+	}
+	if body.ExpiresAt.IsZero() {
+		t.Error("expected non-zero expires_at in register response")
 	}
 
 	cookies := cookieMap(rec)
@@ -239,13 +243,17 @@ func TestLoginHandler_Success(t *testing.T) {
 		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body)
 	}
 
-	type userBody struct {
-		Email string `json:"email"`
-		Name  string `json:"name"`
+	type authBody struct {
+		Email     string    `json:"email"`
+		Name      string    `json:"name"`
+		ExpiresAt time.Time `json:"expires_at"`
 	}
-	body := decodeBody[userBody](t, rec)
+	body := decodeBody[authBody](t, rec)
 	if body.Email != user.Email {
 		t.Errorf("email: got %q, want %q", body.Email, user.Email)
+	}
+	if body.ExpiresAt.IsZero() {
+		t.Error("expected non-zero expires_at in login response")
 	}
 
 	cookies := cookieMap(rec)
