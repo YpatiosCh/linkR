@@ -2,6 +2,11 @@ package main
 
 import (
 	"context"
+	"linkMe/config"
+	"linkMe/internal/handlers"
+	"linkMe/internal/repository"
+	"linkMe/internal/router"
+	"linkMe/internal/service"
 	"linkMe/pkg/dotenv"
 	"log"
 	"net/http"
@@ -10,18 +15,21 @@ import (
 )
 
 // main is the application entry point. It loads environment variables,
-// resolves the DATABASE_URL, creates and pings the pgx connection pool,
-// registers a health-check handler on a new HTTP mux, and serves HTTP
-// on :8080 until the process terminates.
+// validates the application config, creates and pings the pgx connection
+// pool, constructs the repository, service, and handler managers over the
+// pool, registers routes on a new HTTP mux, and serves HTTP on :8080.
 func main() {
 	dotenv.Load()
 
-	dbUrl := dotenv.GetEnv("DATABASE_URL", "")
-	if dbUrl == "" {
+	cfg := config.Load()
+	if cfg.DatabaseURL == "" {
 		log.Fatal("DATABASE_URL is not set")
 	}
+	if cfg.JWTSecret == "" {
+		log.Fatal("JWT_SECRET is not set")
+	}
 
-	pool, err := pgxpool.New(context.Background(), dbUrl)
+	pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
 	if err != nil {
 		log.Fatal("unable to create connection pool: %w", err)
 	}
@@ -32,14 +40,12 @@ func main() {
 	}
 	log.Println("connected to database")
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
+	repos    := repository.NewRepoManager(pool)
+	services := service.NewServiceManager(repos, cfg)
+	h        := handlers.NewHandlerManager(services)
 
 	log.Println("server listening on :8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	if err := http.ListenAndServe(":8080", router.SetupRoutes(h, cfg)); err != nil {
 		log.Fatal(err)
 	}
 }
