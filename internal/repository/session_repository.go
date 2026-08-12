@@ -2,10 +2,14 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	db "linkMe/internal/db/generated"
 	"linkMe/internal/models"
+	"linkMe/internal/msgs"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -60,6 +64,79 @@ func (r *sessionRepository) CreateSession(ctx context.Context, s models.Session)
 	}
 
 	return dbSessionToDomain(row), nil
+}
+
+// GetSessionByTokenHash returns the session whose refresh_token_hash matches
+// the given hash, including revoked sessions so that callers can detect token
+// reuse. pgx.ErrNoRows is translated to msgs.ErrTokenInvalid; other errors
+// are wrapped with context.
+func (r *sessionRepository) GetSessionByTokenHash(ctx context.Context, tokenHash string) (models.Session, error) {
+	q := r.querier(ctx)
+	row, err := q.GetSessionByTokenHash(ctx, tokenHash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return models.Session{}, msgs.ErrTokenInvalid
+		}
+		return models.Session{}, fmt.Errorf("getting session by token hash: %w", err)
+	}
+	return dbSessionToDomain(row), nil
+}
+
+// MarkSessionConsumed sets revoked_at = now() on the session with the given
+// ID, recording that it has been rotated and must not be accepted again.
+// Any database error is wrapped with context.
+func (r *sessionRepository) MarkSessionConsumed(ctx context.Context, id uuid.UUID) error {
+	q := r.querier(ctx)
+	if err := q.MarkSessionConsumed(ctx, id); err != nil {
+		return fmt.Errorf("marking session consumed: %w", err)
+	}
+	return nil
+}
+
+// RevokeSessionFamily sets revoked_at = now() on every non-revoked session
+// belonging to the given token family. Used when a consumed refresh token is
+// reused, signalling a possible token theft. Any database error is wrapped.
+func (r *sessionRepository) RevokeSessionFamily(ctx context.Context, familyID uuid.UUID) error {
+	q := r.querier(ctx)
+	if err := q.RevokeSessionFamily(ctx, familyID); err != nil {
+		return fmt.Errorf("revoking session family: %w", err)
+	}
+	return nil
+}
+
+// RevokeSession sets revoked_at = now() on the session with the given ID,
+// invalidating it for all future use. Idempotent — safe to call on an
+// already-revoked session. Used during explicit logout.
+func (r *sessionRepository) RevokeSession(ctx context.Context, id uuid.UUID) error {
+	q := r.querier(ctx)
+	if err := q.RevokeSession(ctx, id); err != nil {
+		return fmt.Errorf("revoking session: %w", err)
+	}
+	return nil
+}
+
+// RevokeAllSessionsForUser sets revoked_at = now() on every non-revoked
+// session belonging to the given user, used during logout-all.
+func (r *sessionRepository) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error {
+	q := r.querier(ctx)
+	if err := q.RevokeAllSessionsForUser(ctx, userID); err != nil {
+		return fmt.Errorf("revoking all sessions for user: %w", err)
+	}
+	return nil
+}
+
+// RevokeOtherSessionsForUser sets revoked_at = now() on every non-revoked
+// session belonging to the given user except keepSessionID, used during
+// password change to keep the current session alive.
+func (r *sessionRepository) RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) error {
+	q := r.querier(ctx)
+	if err := q.RevokeOtherSessionsForUser(ctx, db.RevokeOtherSessionsForUserParams{
+		UserID: userID,
+		ID:     keepSessionID,
+	}); err != nil {
+		return fmt.Errorf("revoking other sessions for user: %w", err)
+	}
+	return nil
 }
 
 // dbSessionToDomain maps a sqlc db.Session row to a domain models.Session,

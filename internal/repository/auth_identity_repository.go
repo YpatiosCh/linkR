@@ -8,6 +8,7 @@ import (
 	"linkMe/internal/models"
 	"linkMe/internal/msgs"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -77,6 +78,37 @@ func (r *authIdentityRepository) GetAuthIdentityByProviderAndSubject(ctx context
 		return models.AuthIdentity{}, fmt.Errorf("error getting auth identity: %w", err)
 	}
 	return dbAuthIdentityToDomain(row), nil
+}
+
+// GetAuthIdentityByUserIDAndProvider returns the auth identity for the given
+// user and provider. pgx.ErrNoRows is translated to msgs.ErrUserNotFound; other
+// errors are wrapped and returned.
+func (r *authIdentityRepository) GetAuthIdentityByUserIDAndProvider(ctx context.Context, userID uuid.UUID, provider string) (models.AuthIdentity, error) {
+	q := r.querier(ctx)
+	row, err := q.GetAuthIdentityByUserIDAndProvider(ctx, db.GetAuthIdentityByUserIDAndProviderParams{
+		UserID:   userID,
+		Provider: provider,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return models.AuthIdentity{}, msgs.ErrUserNotFound
+		}
+		return models.AuthIdentity{}, fmt.Errorf("getting auth identity by user and provider: %w", err)
+	}
+	return dbAuthIdentityToDomain(row), nil
+}
+
+// UpdatePasswordHash replaces password_hash on the password identity for the
+// given user. Any database error is wrapped with context.
+func (r *authIdentityRepository) UpdatePasswordHash(ctx context.Context, userID uuid.UUID, newHash string) error {
+	q := r.querier(ctx)
+	if err := q.UpdatePasswordHash(ctx, db.UpdatePasswordHashParams{
+		UserID:       userID,
+		PasswordHash: pgtype.Text{String: newHash, Valid: true},
+	}); err != nil {
+		return fmt.Errorf("updating password hash: %w", err)
+	}
+	return nil
 }
 
 // dbAuthIdentityToDomain maps a sqlc db.AuthIdentity row to a domain

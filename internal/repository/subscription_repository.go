@@ -2,9 +2,14 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	db "linkMe/internal/db/generated"
 	"linkMe/internal/models"
+	"linkMe/internal/msgs"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // subscriptionRepository implements SubscriptionRepository on top of
@@ -47,6 +52,21 @@ func (r *subscriptionRepository) CreateUserSubscription(ctx context.Context, sub
 		return models.Subscription{}, fmt.Errorf("error creating user subscription: %w", err)
 	}
 
+	return dbSubscriptionToDomain(row), nil
+}
+
+// GetActiveSubscriptionByUserID returns the most recent active subscription
+// for the given user. pgx.ErrNoRows is translated to
+// msgs.ErrSubscriptionNotFound; other errors are wrapped with context.
+func (r *subscriptionRepository) GetActiveSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (models.Subscription, error) {
+	q := r.querier(ctx)
+	row, err := q.GetActiveSubscriptionByUserID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return models.Subscription{}, msgs.ErrSubscriptionNotFound
+		}
+		return models.Subscription{}, fmt.Errorf("getting active subscription: %w", err)
+	}
 	return dbSubscriptionToDomain(row), nil
 }
 
