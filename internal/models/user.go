@@ -29,6 +29,14 @@ type RegisterInput struct {
 	Name     string
 }
 
+// LoginInput carries the credentials submitted when authenticating with an
+// existing email/password account. The plain-text Password is used only to
+// verify against the stored hash and is never stored on the User model.
+type LoginInput struct {
+	Email    string
+	Password string
+}
+
 // AuthIdentity binds a user to an authentication credential. PasswordHash is
 // set only for email/password identities and is nil for accounts that sign in
 // through an external provider.

@@ -21,4 +21,6 @@ var (
 	ErrSessionRevoked = errors.New("session has been revoked")
 	// ErrTokenReuseDetected is returned when an already-rotated refresh token is used again.
 	ErrTokenReuseDetected = errors.New("refresh token reuse detected")
+	// ErrSubscriptionNotFound is returned when no active subscription exists for the user.
+	ErrSubscriptionNotFound = errors.New("no active subscription found")
 )

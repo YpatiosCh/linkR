@@ -1,6 +1,9 @@
 package service
 
-import "linkMe/internal/repository"
+import (
+	"linkMe/config"
+	"linkMe/internal/repository"
+)
 
 // ServiceManager implements Service by holding the concrete sub-services
 // and wiring them to the shared repositories.
@@ -8,11 +11,12 @@ type ServiceManager struct {
 	authService AuthService
 }
 
-// NewServiceManager builds a Service wired to the given repositories,
-// constructing the auth service (and any other sub-services) on top of them.
-func NewServiceManager(repos repository.Repository) Service {
+// NewServiceManager builds a Service wired to the given repositories and
+// application config, constructing the auth service (and any other
+// sub-services) on top of them.
+func NewServiceManager(repos repository.Repository, cfg config.Config) Service {
 	return &ServiceManager{
-		authService: NewAuthService(repos),
+		authService: NewAuthService(repos, cfg),
 	}
 }
 

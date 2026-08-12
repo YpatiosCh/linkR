@@ -23,4 +23,8 @@ const (
 	CodeTokenReuseDetected = "TOKEN_REUSE_DETECTED"
 	// CodeInternalError indicates an unexpected server-side failure.
 	CodeInternalError = "INTERNAL_ERROR"
+	// CodeUnauthorized indicates a request reached a protected resource without valid credentials.
+	CodeUnauthorized = "UNAUTHORIZED"
+	// CodeTooManyRequests indicates the client has exceeded the rate limit for this endpoint.
+	CodeTooManyRequests = "TOO_MANY_REQUESTS"
 )

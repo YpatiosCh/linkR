@@ -14,14 +14,15 @@ var errorStatusMap = map[error]struct {
 	Status int
 	Code   string
 }{
-	msgs.ErrInvalidCredentials: {http.StatusUnauthorized, CodeInvalidCredentials},
-	msgs.ErrEmailAlreadyExists: {http.StatusConflict, CodeEmailAlreadyExists},
-	msgs.ErrUserNotFound:       {http.StatusNotFound, CodeUserNotFound},
-	msgs.ErrPasswordNotSet:     {http.StatusBadRequest, CodePasswordNotSet},
-	msgs.ErrTokenInvalid:       {http.StatusUnauthorized, CodeTokenInvalid},
-	msgs.ErrTokenAlreadyUsed:   {http.StatusUnauthorized, CodeTokenAlreadyUsed},
-	msgs.ErrSessionRevoked:     {http.StatusUnauthorized, CodeSessionRevoked},
-	msgs.ErrTokenReuseDetected: {http.StatusUnauthorized, CodeTokenReuseDetected},
+	msgs.ErrInvalidCredentials:   {http.StatusUnauthorized, CodeInvalidCredentials},
+	msgs.ErrEmailAlreadyExists:   {http.StatusConflict, CodeEmailAlreadyExists},
+	msgs.ErrUserNotFound:         {http.StatusNotFound, CodeUserNotFound},
+	msgs.ErrPasswordNotSet:       {http.StatusBadRequest, CodePasswordNotSet},
+	msgs.ErrTokenInvalid:         {http.StatusUnauthorized, CodeTokenInvalid},
+	msgs.ErrTokenAlreadyUsed:     {http.StatusUnauthorized, CodeTokenAlreadyUsed},
+	msgs.ErrSessionRevoked:       {http.StatusUnauthorized, CodeSessionRevoked},
+	msgs.ErrTokenReuseDetected:   {http.StatusUnauthorized, CodeTokenReuseDetected},
+	msgs.ErrSubscriptionNotFound: {http.StatusInternalServerError, CodeInternalError},
 }
 
 // HandleError writes a JSON error response for the given error.
