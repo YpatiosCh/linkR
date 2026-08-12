@@ -15,9 +15,18 @@ type Querier interface {
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	CreateUserSubscription(ctx context.Context, arg CreateUserSubscriptionParams) (UserSubscription, error)
+	GetActiveSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (UserSubscription, error)
 	GetAuthIdentityByProviderAndSubject(ctx context.Context, arg GetAuthIdentityByProviderAndSubjectParams) (AuthIdentity, error)
+	GetAuthIdentityByUserIDAndProvider(ctx context.Context, arg GetAuthIdentityByUserIDAndProviderParams) (AuthIdentity, error)
+	GetSessionByTokenHash(ctx context.Context, refreshTokenHash string) (Session, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (User, error)
+	MarkSessionConsumed(ctx context.Context, id uuid.UUID) error
+	RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error
+	RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) error
+	RevokeSession(ctx context.Context, id uuid.UUID) error
+	RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) error
+	UpdatePasswordHash(ctx context.Context, arg UpdatePasswordHashParams) error
 }
 
 var _ Querier = (*Queries)(nil)

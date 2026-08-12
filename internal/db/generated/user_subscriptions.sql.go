@@ -44,3 +44,26 @@ func (q *Queries) CreateUserSubscription(ctx context.Context, arg CreateUserSubs
 	)
 	return i, err
 }
+
+const getActiveSubscriptionByUserID = `-- name: GetActiveSubscriptionByUserID :one
+SELECT id, user_id, plan_id, status, started_at, ends_at, created_at, updated_at FROM user_subscriptions
+WHERE user_id = $1 AND status = 'active'
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+func (q *Queries) GetActiveSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (UserSubscription, error) {
+	row := q.db.QueryRow(ctx, getActiveSubscriptionByUserID, userID)
+	var i UserSubscription
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.PlanID,
+		&i.Status,
+		&i.StartedAt,
+		&i.EndsAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}

@@ -53,3 +53,75 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 	)
 	return i, err
 }
+
+const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
+SELECT id, user_id, refresh_token_hash, token_family_id, created_at, expires_at, last_used_at, revoked_at, ip_address, user_agent FROM sessions WHERE refresh_token_hash = $1
+`
+
+func (q *Queries) GetSessionByTokenHash(ctx context.Context, refreshTokenHash string) (Session, error) {
+	row := q.db.QueryRow(ctx, getSessionByTokenHash, refreshTokenHash)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RefreshTokenHash,
+		&i.TokenFamilyID,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.LastUsedAt,
+		&i.RevokedAt,
+		&i.IpAddress,
+		&i.UserAgent,
+	)
+	return i, err
+}
+
+const markSessionConsumed = `-- name: MarkSessionConsumed :exec
+UPDATE sessions SET revoked_at = now() WHERE id = $1
+`
+
+func (q *Queries) MarkSessionConsumed(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markSessionConsumed, id)
+	return err
+}
+
+const revokeAllSessionsForUser = `-- name: RevokeAllSessionsForUser :exec
+UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL
+`
+
+func (q *Queries) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, revokeAllSessionsForUser, userID)
+	return err
+}
+
+const revokeOtherSessionsForUser = `-- name: RevokeOtherSessionsForUser :exec
+UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id != $2 AND revoked_at IS NULL
+`
+
+type RevokeOtherSessionsForUserParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	ID     uuid.UUID `json:"id"`
+}
+
+func (q *Queries) RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) error {
+	_, err := q.db.Exec(ctx, revokeOtherSessionsForUser, arg.UserID, arg.ID)
+	return err
+}
+
+const revokeSession = `-- name: RevokeSession :exec
+UPDATE sessions SET revoked_at = now() WHERE id = $1
+`
+
+func (q *Queries) RevokeSession(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, revokeSession, id)
+	return err
+}
+
+const revokeSessionFamily = `-- name: RevokeSessionFamily :exec
+UPDATE sessions SET revoked_at = now() WHERE token_family_id = $1 AND revoked_at IS NULL
+`
+
+func (q *Queries) RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, revokeSessionFamily, tokenFamilyID)
+	return err
+}
