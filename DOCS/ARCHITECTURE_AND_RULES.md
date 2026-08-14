@@ -1,6 +1,6 @@
 # linkMe Backend — Architecture & Hard Rules
 
-> Last updated: 2026-08-12
+> Last updated: 2026-08-14
 > Applies to: the entire `linkMe` Go backend (module `linkMe`).
 
 This document is the single source of truth for **how this project is structured**
@@ -106,7 +106,7 @@ below it. Nothing ever depends upward or skips a layer.
 
 Shared support packages (imported by any of the above, never importing them back):
    internal/msgs    sentinel errors (the contract between layers)
-   internal/utils   internal helpers (response, validate, token, jwttoken)
+   internal/utils   internal helpers (response, validate, token, jwttoken, cookies)
    pkg              self-contained helpers (dotenv, hash)
 ```
 
@@ -147,13 +147,14 @@ Layer-agnostic structs shared by repository, service, and handlers. Pure data,
 no sqlc/pgx types, no HTTP concerns. Optional fields are pointers
 (`AvatarURL *string`, `EmailVerifiedAt *time.Time`, `PasswordHash *string`).
 
-Files: `user.go` (User, AuthIdentity), `session.go`, `subscription.go`,
-`plan.go` (PLAN enum + Plan + `CreatePlan`).
+Files: `user.go` (User, AuthIdentity, RegisterInput, LoginInput), `session.go`,
+`subscription.go`, `plan.go` (PLAN enum + Plan + `CreatePlan`), `token.go`
+(`TokenPair`), `request.go`/`response.go` (HTTP DTOs, see §4).
 
-> ⚠ Known smell: `models.RegisterInput` (in `models/user.go`) is dead code —
-> the live input type is `service.RegisterInput`. Do not replicate this.
-> When a type is needed at a layer boundary, define it once where it is
-> consumed and delete the unused copy (Rule E4).
+Any struct that crosses a layer boundary — service input/output, HTTP
+request/response — belongs here, defined exactly once (Rule E4/G4). Don't
+declare a boundary-crossing type inside `service/` or `handlers/` "for now";
+audit new sub-services/handlers against this when they're added.
 
 ### 3.3 `internal/repository` — data access layer
 
@@ -191,10 +192,14 @@ validation, no HTTP. Returns only `models.*` types — never sqlc rows or
 
 Same pattern: `interface.go` + `manager.go` + one file per feature service.
 
-- `interface.go` — `Service` (aggregate exposing `Auth() AuthService`) and
-  `AuthService` (e.g. `Register(ctx, RegisterInput) (models.User, string, error)`).
+- `interface.go` — `Service` (aggregate exposing `Auth() AuthService`,
+  `User() UserService`, and `Email() EmailService`), `AuthService`
+  (Register/Login/Refresh/Logout/LogoutAll), `UserService` (GetMe/ChangePassword
+  — authenticated current-user profile operations, kept separate from
+  `AuthService` since they aren't authentication flows), `EmailService`
+  (SendVerificationEmail/SendPasswordResetEmail, per auth spec §54).
 - `manager.go` — `ServiceManager` holds the concrete sub-services;
-  `NewServiceManager(repos repository.Repository) Service`.
+  `NewServiceManager(repos repository.Repository, cfg config.Config) Service`.
 - `auth_service.go` — `authService` **embeds** `repository.Repository` so it can
   reach every repository and `WithinTx` directly (`s.User()`, `s.AuthIdentity()`,
   `s.Session()`, `s.WithinTx(...)`). The `Register` flow shows the canonical
@@ -206,18 +211,39 @@ Same pattern: `interface.go` + `manager.go` + one file per feature service.
   4. run all writes inside a single `WithinTx` (user + auth identity + free plan subscription);
   5. perform post-commit work (`issueSession` → generate opaque token, store its
      SHA-256 hash in a session row, return the raw token to the caller);
-  6. return domain values + raw token; errors are sentinels from `msgs` or wrapped.
+  6. return domain values + a `models.TokenPair`; errors are sentinels from
+     `msgs` or wrapped.
+- `user_service.go` — `userService` embeds `repository.Repository` (no `config.Config`
+  needed — it never issues tokens). Implements `GetMe` and `ChangePassword`.
+- `email_service.go` — `emailService` (no repository — holds a `*resend.Client`
+  and `cfg config.Config`, reading `cfg.EmailFrom`/`cfg.FrontendURL` directly
+  rather than taking them as loose constructor strings, the same way
+  `authService` reads `cfg.JWTSecret`) backed by `github.com/resend/resend-go/v3`.
+  `client *resend.Client` is still taken as a constructor parameter (not built
+  inside `NewEmailService`) so tests can inject one wrapping a fake
+  `http.RoundTripper` — no network access needed (see
+  `test/service/email_service_test.go`). `manager.go` always constructs the
+  Resend-backed implementation from `cfg.ResendAPIKey`; `cmd/server/main.go`
+  fails fast at startup (`log.Fatal`) if it's unset, same as
+  `DatabaseURL`/`JWTSecret` — there is no dev/noop fallback, Resend is
+  required. The two static inline HTML bodies live in
+  `internal/utils/emailtemplates` (`VerificationEmailHTML`/
+  `PasswordResetEmailHTML`) rather than inside the service package — pure
+  string-rendering with no repository/service state, so it belongs in
+  `utils/` per Rule A4, not in `service/`. No templating dependency (Rule G3).
 
-Service input DTOs live here (`RegisterInput`). Validation uses
-`internal/utils/validate` — the service layer owns all validation rules, never
-the handlers.
+Service input/output DTOs that cross the service↔handler boundary live in
+`internal/models` (`RegisterInput`, `LoginInput`, `TokenPair`), never declared
+inside the service package. Validation uses `internal/utils/validate` — the
+service layer owns all validation rules, never the handlers.
 
 ### 3.5 `internal/handlers` — HTTP layer
 
 Same pattern: `interface.go` + `manager.go` + one file per handler group.
 
-- `interface.go` — `Handler` (aggregate exposing `Auth() AuthHandler` and `Me() MeHandler`),
-  `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll), `MeHandler` (GetMe/ChangePassword).
+- `interface.go` — `Handler` (aggregate exposing `Auth() AuthHandler` and `User() UserHandler`),
+  `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll), `UserHandler` (GetMe/ChangePassword,
+  and the future home of other profile-related endpoints).
 - `manager.go` — `HandlerManager` holds concrete handler groups;
   `NewHandlerManager(service service.Service) Handler`.
 - `auth_handler.go` — `authHandler` **embeds** `service.Service`. Canonical shape:
@@ -225,10 +251,15 @@ Same pattern: `interface.go` + `manager.go` + one file per handler group.
   1. decode the JSON body into a request DTO; on failure → `response.Error(w, 400, CodeInvalidBody, …)`;
   2. call the service with `r.Context()`;
   3. on service error → `response.HandleError(w, err)` (centralized mapping, §3.8);
-  4. on success → set cookies if needed and write `response.JSON(...)`.
+  4. on success → set cookies via `utils/cookies` if needed and write `response.JSON(...)`.
 
-- `me_handler.go` — `meHandler` handles authenticated current-user routes. Reads
-  JWT claims via `middleware.AuthClaims(r)` (imported from `internal/middleware`).
+  Cookie helpers (`cookies.SetTokenCookies`, `cookies.ClearTokenCookies`) live in
+  `internal/utils/cookies`, not in the handler file — handlers stay transport-only
+  and any handler needing to set auth cookies reuses the same helper (G4).
+
+- `user_handler.go` — `userHandler` handles authenticated current-user routes
+  (GetMe/ChangePassword). Reads JWT claims via `middleware.AuthClaims(r)`
+  (imported from `internal/middleware`).
 
 ⚠ **Auth middleware is not in this package.** `RequireAuth`, `AuthClaims`, and
 `bearerToken` live in `internal/middleware/auth.go` (`package middleware`). Handlers
@@ -260,6 +291,9 @@ New business error → declare it here, then map it in `response/handle.go`
 | `internal/utils/response` | `JSON`, `Error`, `HandleError`, `codes.go` (`Code*` constants), `errorStatusMap` | yes (`msgs`) |
 | `internal/utils/validate` | `NormalizeEmail`, `Email`, `Password`, `Name` + limits | no |
 | `internal/utils/token` | `Generate()` (32-byte opaque base64url token), `Hash()` (SHA-256 hex) | no |
+| `internal/utils/jwttoken` | `Issue`, `Verify`, `AccessTokenDuration` — HS256 access tokens | no |
+| `internal/utils/cookies` | `SetTokenCookies`, `ClearTokenCookies` — HttpOnly auth cookie read/write, shared by any handler | yes (`models`, `utils/jwttoken`) |
+| `internal/utils/emailtemplates` | `VerificationEmailHTML(link)`, `PasswordResetEmailHTML(link)` — static inline HTML bodies for the two transactional emails | no |
 
 The boundary rule (Rule B4): `pkg/` packages are self-contained and must never
 import `linkMe/internal/*`. `utils/` packages may import other internal packages.
@@ -618,40 +652,77 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-12. Update this section whenever a milestone lands.
+Snapshot as of 2026-08-14 (email verification + password reset). Update this section whenever a milestone lands.
 
 ### Implemented
 
 - **Entry point**: `cmd/server/main.go` — dotenv load, config validation, pgx pool + ping,
   composition root (repository → service → handler managers), delegates all route/middleware
   wiring to `router.SetupRoutes(h, cfg)`, listen on `:8080`.
-- **Config**: `config/config.go` — `Config{DatabaseURL, JWTSecret, AllowedOrigins []string, AppEnv string}`.
-  `CORS_ALLOWED_ORIGINS` (comma-separated, default `http://localhost:3000`); `APP_ENV`
-  (default `"development"`). Passed to constructors via struct — never as individual args.
+- **Config**: `config/config.go` — `Config{DatabaseURL, JWTSecret, AllowedOrigins []string,
+  AppEnv, ResendAPIKey, EmailFrom, FrontendURL string}`. `CORS_ALLOWED_ORIGINS`
+  (comma-separated, default `http://localhost:3000`); `APP_ENV` (default
+  `"development"`); `FRONTEND_URL` (default `http://localhost:3000`). Passed to
+  constructors via struct — never as individual args. `cmd/server/main.go`
+  validates `DatabaseURL`, `JWTSecret`, and `ResendAPIKey` are non-empty at
+  startup (`log.Fatal` otherwise) — `EmailFrom`/`FrontendURL` are not validated.
 - **Schema (migrations, all 8 tables)**: users, auth_identities, email_verification_tokens,
   password_reset_tokens, plans, user_subscriptions, audit_events, sessions.
-- **Queries + generated code**: users (create/get-by-email/get-by-id), auth_identities
-  (create/get-by-provider+subject/get-by-user+provider/update-password-hash), sessions
-  (create/get-by-token-hash/mark-consumed/revoke-session/revoke-family/revoke-all-for-user/
-  revoke-other-for-user), user_subscriptions (create/get-active-by-user-id).
-- **Domain models**: User, AuthIdentity, Session, Subscription, Plan/PLAN + `CreatePlan`.
-  Request DTOs: `models/request.go` (RegisterRequest, LoginRequest, PasswordChangeRequest).
-  Response DTOs: `models/response.go` (UserResponse, RefreshResponse, MeResponse, MePlanResponse).
-- **Repository layer**: `RepoManager` + 4 entity repositories, `WithinTx` + context-injected
+- **Queries + generated code**: users (create/get-by-email/get-by-id/update-email-verified-at),
+  auth_identities (create/get-by-provider+subject/get-by-user+provider/update-password-hash),
+  sessions (create/get-by-token-hash/mark-consumed/revoke-session/revoke-family/revoke-all-for-user/
+  revoke-other-for-user), user_subscriptions (create/get-active-by-user-id),
+  email_verification_tokens (create/get-by-hash/mark-consumed), password_reset_tokens
+  (create/get-by-hash/mark-consumed).
+- **Domain models**: User, AuthIdentity, Session, Subscription, Plan/PLAN + `CreatePlan`,
+  `TokenPair` (`models/token.go` — moved out of the service package since it crosses the
+  service↔handler boundary), `EmailVerificationToken`, `PasswordResetToken`.
+  Request DTOs: `models/request.go` (RegisterRequest, LoginRequest, PasswordChangeRequest,
+  RequestEmailVerificationRequest, VerifyEmailRequest, RequestPasswordResetRequest,
+  ResetPasswordRequest).
+  Response DTOs: `models/response.go` (UserResponse, RefreshResponse, MeResponse,
+  MePlanResponse, MessageResponse — the generic `{"message":...}` shape shared by both
+  "request" endpoints).
+- **Repository layer**: `RepoManager` + 6 entity repositories, `WithinTx` + context-injected
   transactions, `dbXToDomain` mappers. `AuthIdentityRepository` includes
   `GetAuthIdentityByUserIDAndProvider` + `UpdatePasswordHash`. `SessionRepository` includes
-  `RevokeSession`, `RevokeAllSessionsForUser`, `RevokeOtherSessionsForUser`.
-- **Service layer**: `ServiceManager` + full `AuthService`:
-  - `Register` — normalize/validate → email-exists check → Argon2id → transactional user+identity+free-plan → issue JWT + refresh token
-  - `Login` — normalize/validate → password identity → VerifyPassword → issue JWT + refresh token; every failure → same `ErrInvalidCredentials` (enumeration defense)
-  - `Refresh` — hash lookup → reuse detection (RevokedAt → RevokeFamily + ErrTokenReuseDetected) → expiry check → WithinTx(MarkConsumed + new session in same family) → new JWT + refresh token
-  - `Logout` — RevokeSession (idempotent)
-  - `LogoutAll` — RevokeAllSessionsForUser
-  - `GetMe` — GetUserByID + GetActiveSubscriptionByUserID
-  - `ChangePassword` — validate new password → get password identity (ErrPasswordNotSet if OAuth-only) → verify current password → Argon2id hash → WithinTx(UpdatePasswordHash + RevokeOtherSessionsForUser keeping current session)
-- **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll)
-  + `MeHandler` (GetMe/ChangePassword). Logout/LogoutAll clear cookies (`MaxAge=-1`).
-  GetMe wraps in `{"data":{...}}` envelope. Both MeHandler methods read claims via
+  `RevokeSession`, `RevokeAllSessionsForUser`, `RevokeOtherSessionsForUser`. `UserRepository`
+  includes `UpdateEmailVerifiedAt`. `EmailVerificationTokenRepository` and
+  `PasswordResetTokenRepository` (`Create`/`GetByHash`/`MarkConsumed` each) mirror
+  `SessionRepository`'s "return any row including used ones, let the service decide"
+  pattern for `GetByHash`.
+- **Service layer**: `ServiceManager` + `AuthService` + `UserService` + `EmailService`
+  (`AuthService`/`UserService` split — profile operations don't live on `AuthService`;
+  `VerifyEmail`/`RequestPasswordReset`/`ResetPassword` live on `AuthService`, not
+  `UserService`, since — like `Register`/`Login`/`Refresh` — they're public/token-authenticated
+  and never go through `RequireAuth`):
+  - `AuthService.Register` — normalize/validate → email-exists check → Argon2id → transactional user+identity+free-plan → issue JWT + refresh token
+  - `AuthService.Login` — normalize/validate → password identity → VerifyPassword → issue JWT + refresh token; every failure → same `ErrInvalidCredentials` (enumeration defense)
+  - `AuthService.Refresh` — hash lookup → reuse detection (RevokedAt → RevokeFamily + ErrTokenReuseDetected) → expiry check → WithinTx(MarkConsumed + new session in same family) → new JWT + refresh token
+  - `AuthService.Logout` — RevokeSession (idempotent)
+  - `AuthService.LogoutAll` — RevokeAllSessionsForUser
+  - `AuthService.RequestEmailVerification` — normalize/validate email → silent no-op if unknown or already verified → generate opaque token (24h expiry) → store hash → `EmailService.SendVerificationEmail`
+  - `AuthService.VerifyEmail` — hash lookup (unknown/expired → `ErrTokenInvalid`, used → `ErrTokenAlreadyUsed`) → WithinTx(UpdateEmailVerifiedAt + MarkConsumed) → return user + active subscription (same shape as `GetMe`)
+  - `AuthService.RequestPasswordReset` — normalize/validate email → silent no-op if unknown → generate opaque token (1h expiry) → store hash → `EmailService.SendPasswordResetEmail`
+  - `AuthService.ResetPassword` — validate new password → hash lookup (same invalid/used checks as above) → get password identity (`ErrPasswordNotSet` if OAuth-only) → Argon2id hash → WithinTx(UpdatePasswordHash + MarkConsumed + RevokeAllSessionsForUser)
+  - `UserService.GetMe` — GetUserByID + GetActiveSubscriptionByUserID
+  - `UserService.ChangePassword` — validate new password → get password identity (ErrPasswordNotSet if OAuth-only) → verify current password → Argon2id hash → WithinTx(UpdatePasswordHash + RevokeOtherSessionsForUser keeping current session)
+  - `EmailService` (`SendVerificationEmail`/`SendPasswordResetEmail`) — always
+    Resend-backed (`emailService`); `RESEND_API_KEY` is required at startup
+    (`cmd/server/main.go` fails fast if unset), no dev/noop fallback; consumed
+    by `AuthService` via a constructor dependency
+    (`NewAuthService(repos, cfg, emailSvc)`).
+- **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll/
+  RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword) + `UserHandler`
+  (GetMe/ChangePassword — renamed from `MeHandler` since it will grow to cover profile
+  operations beyond `/me`). Logout/LogoutAll clear cookies via `utils/cookies.ClearTokenCookies`.
+  GetMe and VerifyEmail both wrap in `{"data": <MeResponse>}` — VerifyEmail reuses the exact
+  same response shape (auth spec §7.2 calls for "the authenticated user's public account
+  representation", which is what `GET /api/v1/me` already returns). RequestEmailVerification
+  and RequestPasswordReset always respond 200 with a fixed generic `MessageResponse` message
+  regardless of whether the target email exists (enumeration defense) — the handler doesn't
+  branch on the service's outcome. ResetPassword responds 204, consistent with
+  `UserHandler.ChangePassword`. Both `UserHandler` methods read claims via
   `middleware.AuthClaims(r)`.
 - **Middleware** (`internal/middleware/`):
   - `auth.go` — `RequireAuth(jwtSecret)` (Bearer header → cookie fallback, JWT verify, claims injection) + `AuthClaims(r)`
@@ -670,31 +741,47 @@ Snapshot as of 2026-08-12. Update this section whenever a milestone lands.
   - `POST /api/v1/auth/logout-all` — 5/15min rate limit + RequireAuth
   - `GET /api/v1/me` — 60/15min rate limit + RequireAuth
   - `POST /api/v1/me/password/change` — 5/15min rate limit + RequireAuth
+  - `POST /api/v1/auth/email/verification/request` — 5/hour rate limit, public
+  - `POST /api/v1/auth/email/verification/verify` — 10/15min rate limit, public
+  - `POST /api/v1/auth/password/reset/request` — 5/hour rate limit, public
+  - `POST /api/v1/auth/password/reset/confirm` — 10/15min rate limit, public
+  (Rate limits for these four are not spec-mandated numbers — the spec only says
+  they "should" be protected — chosen to match the existing scheme: email-sending
+  endpoints get `register`'s 5/hour, token-consuming endpoints get `login`'s 10/15min.)
 - **Tests** (under root `test/`, per §3.9/Q6):
-  - `test/service` — Register (success/email-exists/invalid-input), Login (success/4 invalid paths), Refresh (success/reuse/expired), Logout, LogoutAll, GetMe (success/not-found), ChangePassword (success/invalid-creds/oauth-only/weak-password)
-  - `test/handlers` — Register/Login/Refresh/Logout/LogoutAll/GetMe/ChangePassword (happy paths + key error paths)
+  - `test/service/auth_service_test.go` — Register (success/email-exists/invalid-input), Login (success/4 invalid paths), Refresh (success/reuse/expired), Logout, LogoutAll, RequestEmailVerification (success/unknown-email/already-verified), VerifyEmail (success/not-found/expired/already-used), RequestPasswordReset (success/unknown-email), ResetPassword (success/token-invalid/token-already-used/oauth-only/weak-password) — plus the shared `fakeRepo`/`fakeUserRepo`/`fakeIdentityRepo`/`fakeSessionRepo`/`fakeSubscriptionRepo`/`fakeEmailVerificationTokenRepo`/`fakePasswordResetTokenRepo`/`fakeEmailService`/`newTestAuthService` fixtures used across all service test files
+  - `test/service/user_service_test.go` — GetMe (success/not-found), ChangePassword (success/invalid-creds/oauth-only/weak-password)
+  - `test/service/email_service_test.go` — SendVerificationEmail/SendPasswordResetEmail (success + non-2xx) against a fake `http.RoundTripper`, no network access
+  - `test/handlers/auth_handler_test.go` — Register/Login/Refresh/Logout/LogoutAll/RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword (happy paths + key error paths)
+  - `test/handlers/user_handler_test.go` — GetMe/ChangePassword (happy paths + key error paths)
   - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer), AuthClaims outside protected route
   - `test/jwttoken` — Issue/Verify roundtrip, wrong key, tampered, malformed, alg:none, duration constant, distinct tokens
   - `test/hash`, `test/token`, `test/validate`
 - **Helpers**: `pkg/dotenv`, `pkg/hash` (Argon2id PHC), `utils/token` (opaque token + SHA-256),
   `utils/validate`, `utils/response` (envelope, codes, `errorStatusMap`, `HandleError`),
-  `utils/jwttoken`, `msgs` sentinel errors.
+  `utils/jwttoken`, `utils/cookies` (auth cookie set/clear), `msgs` sentinel errors — no new
+  sentinels were needed for verification/reset: `ErrTokenInvalid`/`ErrTokenAlreadyUsed`/
+  `ErrPasswordNotSet`/`ErrInvalidCredentials` already covered every failure mode.
 
 ### Not yet implemented (from the specs)
 
-- Email verification, password reset, email change
 - Google OAuth / account linking
-- Audit events (`audit_events` table exists; nothing writes to it yet)
-- Account deletion
+- Audit events (`audit_events` table exists; nothing writes to it yet — not even
+  Register/Login/the new verification/reset flows; deliberately deferred as one
+  cross-cutting pass across all endpoints rather than partial per-endpoint coverage)
+- Account deletion, email change
+- Automatic verification email on `Register` (verification is opt-in via
+  `POST /api/v1/auth/email/verification/request` today — `Register` is unchanged)
 - Everything in `plans_and_entitlements_v1_backend_spec.md` beyond the plan
   model and free-subscription-on-register behavior
 
 ### Suggested next steps (in order of priority)
 
-1. **Email infrastructure** — `EmailSender` interface + dev implementation (noop or local SMTP); required before email verification and password reset can be completed
-2. **Email verification** + **Password reset** — both need the email sender; tackle together since they share the same token-generation + email-sending infrastructure
-3. **Google OAuth** — large feature; requires OAuth provider abstraction and new routes
-4. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
+1. **Google OAuth** — large feature; requires OAuth provider abstraction and new routes
+2. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
+3. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
+   existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, the new
+   verification/reset flows, …), not bolted onto one feature at a time
 
 ---
 
