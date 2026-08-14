@@ -6,7 +6,7 @@ import "linkMe/internal/service"
 // groups with their shared dependencies, starting from a single service.Service.
 type HandlerManager struct {
 	authHandler AuthHandler
-	meHandler   MeHandler
+	userHandler UserHandler
 }
 
 // NewHandlerManager builds a Handler from a service.Service, constructing
@@ -14,7 +14,7 @@ type HandlerManager struct {
 func NewHandlerManager(service service.Service) Handler {
 	return &HandlerManager{
 		authHandler: NewAuthHandler(service),
-		meHandler:   NewMeHandler(service),
+		userHandler: NewUserHandler(service),
 	}
 }
 
@@ -23,7 +23,7 @@ func (h *HandlerManager) Auth() AuthHandler {
 	return h.authHandler
 }
 
-// Me returns the meHandler managed by this HandlerManager.
-func (h *HandlerManager) Me() MeHandler {
-	return h.meHandler
+// User returns the userHandler managed by this HandlerManager.
+func (h *HandlerManager) User() UserHandler {
+	return h.userHandler
 }
