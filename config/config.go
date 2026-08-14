@@ -14,6 +14,9 @@ type Config struct {
 	JWTSecret      string
 	AllowedOrigins []string
 	AppEnv         string
+	ResendAPIKey   string
+	EmailFrom      string
+	FrontendURL    string
 }
 
 // Load reads configuration from environment variables, falling back to the
@@ -33,5 +36,8 @@ func Load() Config {
 		JWTSecret:      dotenv.GetEnv("JWT_SECRET", ""),
 		AllowedOrigins: origins,
 		AppEnv:         dotenv.GetEnv("APP_ENV", "development"),
+		ResendAPIKey:   dotenv.GetEnv("RESEND_API_KEY", ""),
+		EmailFrom:      dotenv.GetEnv("EMAIL_FROM", ""),
+		FrontendURL:    dotenv.GetEnv("FRONTEND_URL", "http://localhost:3000"),
 	}
 }
