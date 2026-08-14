@@ -1,140 +1,293 @@
 # linkMe — Product Vision
 
-> Last updated: 2026-08-11
-> This is the **living vision** document. Anything we learn, decide, or ideate
-> about the product goes here so future sessions (and humans) build against the
-> same picture. **If a good idea comes up, write it down** (see [§8 Idea Log](#8-idea-log)).
-
-This document is *not* a feature spec. Behavior lives in the per-feature specs
-(`DOCS/authentication_v1_backend_spec.md`, `DOCS/plans_and_entitlements_v1_backend_spec.md`,
-and future product specs). This document explains **what linkMe is and why** —
-the product intent behind the architecture.
+> Last updated: 2026-08-13
+> **Status:** living document. This is the single source of *product intent*. When
+> we learn, decide, or imagine something, it goes here — rough is fine (see
+> [§11 Idea Log](#11-idea-log)).
+>
+> **Scope boundary:** this document explains *what linkMe is and why*. It does **not**
+> define behavior. Behavior lives in the per-feature specs:
+> - `DOCS/authentication_v1_backend_spec.md`
+> - `DOCS/plans_and_entitlements_v1_backend_spec.md`
+> - future product specs (products, checkout, delivery, versioning, affiliates)
+>
+> Where this document and a feature spec disagree, **the feature spec wins** and
+> this document should be corrected.
 
 ---
 
-## 1. Problem
+## 1. One-liner
 
-Creators selling PDFs, templates, digital art, and other digital goods need more
-than a simple delivery system. They need a platform that handles the full sales
-loop: host the file, take the payment, deliver the goods, and keep the buyer
-relationship alive after the sale.
+> **linkMe turns any digital file into a shareable payment link that delivers
+> itself the moment someone pays.**
 
-## 2. Solution (one line)
+Upload a product → share a link → the buyer pays through the link → the file is
+delivered automatically → the buyer keeps lifetime access, including every future
+version.
 
-> Upload products → get payment links → auto-deliver on purchase.
+**The link is the product.** A creator never has to build a store, wire up a
+checkout, host files, or manually email downloads. They paste one link anywhere
+they already have an audience.
 
-The **link is the product**: creators get a shareable payment link per product;
-buyers pay through the link; the digital product delivers automatically on
-purchase.
+---
 
-## 3. Revenue Model
+## 2. The problem we're solving
 
-- **Subscription:** $19–$49/month (Free / Pro plans) for creators.
-- **Platform cut:** a % of sales via `platform_fee` (Stripe Connect
-  application fee at charge time).
-- Both monetize the same value: we are the middleman for **anything digital**
-  that can be sold — not just templates or PDFs.
+Creators who sell digital goods — PDFs, templates, presets, fonts, code, ebooks,
+art packs, courses — are stuck between two bad options:
 
-## 4. Target Audience
+- **Heavy storefront platforms** (full e-commerce suites): powerful but slow to
+  set up, overkill for "I just want to sell this one file," and often priced for
+  businesses rather than individual creators.
+- **DIY duct tape** (a payment button + a cloud drive link + manual email): cheap
+  but fragile. Files leak, delivery breaks, there's no record of who owns what,
+  and updating a product means re-emailing every past buyer by hand.
 
-- Course creators
-- Template sellers
-- Digital artists
-- (Anything digital — audio presets, fonts, code, ebooks, art packs…)
+Neither handles the *full* sales loop well: **host the file, take the payment,
+deliver the goods, and keep the buyer relationship alive after the sale.**
 
-## 5. External Integrations (the only businesses we rely on)
+linkMe owns that entire loop behind a single link.
 
-| Service | Role | Notes |
+---
+
+## 3. Who it's for
+
+Primary users are **individual digital creators** who already have an audience and
+a file to sell:
+
+- Template sellers (Notion, design, spreadsheets, docs)
+- Digital artists (art packs, brushes, textures)
+- Music/audio creators (sample packs, presets, sound kits)
+- Course creators and educators
+- Developers selling code, boilerplates, or assets
+- Writers selling ebooks and guides
+
+The unifying trait is not the file *type* — linkMe is deliberately
+**format-agnostic**. The unifying trait is the *motion*: "I have something
+digital, I want a link that sells and delivers it, and I don't want to run a
+store to do it."
+
+**One account, both roles.** There is no separate "buyer" and "seller" account. A
+single user can sell their own products and buy other creators' products with the
+same login. (See auth spec §3.)
+
+---
+
+## 4. What linkMe is — and isn't
+
+**It is:**
+- A per-product payment link that doubles as the delivery mechanism.
+- Automatic, secure file delivery on successful payment.
+- A durable record of ownership (a buyer's "library" of everything they've bought).
+- A versioning system where updating a product upgrades every existing buyer for free.
+
+**It is not (in V1):**
+- A storefront/marketplace with discovery, browsing, or search across creators.
+- A subscription/membership billing tool for creators' *own* customers.
+- A general file host or cloud-drive competitor.
+- A course LMS (video hosting, lessons, quizzes) — a course is just a file here.
+
+Staying narrow — *link in, delivery out* — is the point. Every feature is judged
+against whether it strengthens that loop.
+
+---
+
+## 5. How linkMe makes money
+
+Two revenue streams, both monetizing the same core value (being the middleman for
+anything digital that can be sold). **These figures are owned by the plans spec —
+this section must match it exactly.**
+
+### 5.1 Subscription (creator-facing)
+
+| Plan | Price | Who it's for |
+|---|---:|---|
+| **Free** | **$0 / month** | Any creator. The full core selling loop works here. |
+| **Pro** | **$19 / month** | Creators who want higher limits, advanced analytics, affiliates, and a lower per-sale fee. |
+
+Free is **fully usable**, not a crippled trial — a creator can run a real business
+on Free indefinitely. Pro is an *upgrade*, not an *unlock* of the basics.
+
+### 5.2 Platform fee (transaction-facing)
+
+A percentage of each successful sale, taken at charge time via **Stripe Connect
+application fees**.
+
+| Plan | Platform fee per sale |
+|---|---:|
+| Free | **5%** |
+| Pro | **1%** |
+
+This is why Free can stay free forever: successful Free creators generate
+transaction revenue through the 5% fee. The fee is calculated **per transaction**,
+never via end-of-month reconciliation.
+
+> **Important (see §5.4 of the vision and the plans-spec review):** the fee rate is
+> resolved from the **authoritative server-side subscription record at charge time**,
+> *not* from the plan snapshot in the access token. A stale or tampered token must
+> never be able to lower a seller's fee.
+
+### 5.3 Why two streams instead of one
+
+They capture different creators at different stages. A hobbyist making a few sales
+a month costs us little and pays via the 5% fee. A creator doing real volume is
+better off on Pro's 1% + $19 — and Pro is where the growth features (affiliates,
+advanced analytics) live, so volume creators self-select into it. The affiliate
+program (see §7.2) is the primary engine pushing Free → Pro.
+
+---
+
+## 6. External dependencies (the whole external surface)
+
+We rely on as few outside businesses as possible. Everything else is ours.
+
+| Service | Role | Why this one |
 |---|---|---|
-| **Cloudflare R2** | Object storage for product files | S3-compatible; **zero egress fees** (critical for a delivery platform). Format-agnostic — any digital file. |
-| **Stripe** | Payments + Connect | Checkout for payment links; **Connect application fees** implement the platform %; also powers **affiliate payouts**. |
+| **Cloudflare R2** | Object storage for product files | S3-compatible with **zero egress fees** — critical when your whole product is delivering downloads. Format-agnostic. |
+| **Stripe** | Payments + Connect | Checkout powers the payment links; **Connect application fees** implement the platform %; Connect also powers **affiliate payouts**. |
 
-**That is the complete external business surface.** Everything else is ours.
+**Storage mental model:**
+- **R2 holds the binaries** — the actual product files.
+- **Postgres holds everything relational** — products, versions, purchases, links,
+  sellers, buyers, entitlements, subscriptions.
+- R2 is object storage, not a database; the two complement each other.
 
-### 5.1 Open gap: transactional email
+### 6.1 Open external dependency: transactional email
 
-Email delivery is *not* a business partner but it is an external dependency we
-haven't chosen yet. We already need it for the auth spec (email verification,
-password reset — see the `NoopEmailSender` seam) and we will need it for
-**buyer notifications on new product versions**. Candidate providers: Resend /
-AWS SES / Mailgun / Postmark. **Open decision.**
+Email is not a *business partner* but it is an external dependency we haven't
+chosen yet. We already need it for:
+- email verification and password reset (auth spec — `NoopEmailSender` seam),
+- **buyer notifications when a product ships a new version** (§7.1).
 
-### 5.2 Storage mental model (corrected)
-
-- **R2 holds the binaries** (the product files).
-- **Postgres holds everything relational**: products, versions, purchases,
-  links, sellers, buyers, entitlements.
-- R2 is object storage, not a database. The two complement each other.
+Candidate providers: Resend / AWS SES / Mailgun / Postmark. **Open decision — see §12.**
 
 ---
 
-## 6. Killer Features
+## 7. The two features that make linkMe worth choosing
 
-### 6.1 Auto product versioning
+Anyone can put a file behind a paywall. These are the reasons to pick linkMe
+specifically.
 
-Sellers can update/upgrade any of their products (e.g. `template_v1` →
-`template_v2`). **Every buyer who already purchased the product immediately
-gets the new version for free** — they come to the platform and download the
-new version, combined with email notifications.
+### 7.1 Lifetime auto-versioning (available on every plan)
 
-Architectural consequence (for the future product spec):
+A purchase binds the buyer to the **product**, not to a specific version.
 
 ```text
-product           → seller's item (template, art pack, …)
-product_versions  → v1, v2, … each with its R2 storage key
-purchase          → binds buyer to PRODUCT, not to a version
+product           → the seller's item (e.g. "Notion CRM template")
+product_versions  → v1, v2, v3 … each with its own R2 storage key
+purchase          → binds buyer ↔ PRODUCT (not a version)
 ```
 
-Because the purchase binds to the **product**, every existing buyer
-automatically owns v2 the moment it is published. No repurchase, no migration,
-no "you bought v1 so you're stuck". The email notification is the funnel that
-brings buyers back to the platform.
+When a seller publishes `v2`, **every existing buyer immediately owns it, for
+free** — no repurchase, no migration, no "you bought v1 so you're stuck." The
+buyer gets an email, comes back to the platform, and downloads the new version
+from their library.
 
-### 6.2 Affiliate program (Pro plan)
+Why it matters: it converts a one-time sale into an ongoing relationship, gives
+buyers a reason to trust the purchase, and gives sellers a reason to keep
+improving products on the platform. The version-notification email is the funnel
+that pulls buyers back.
 
-Creators on the **Pro** plan can let others promote their products for a cut:
-affiliate links per product, commission % configuration, attribution on
-checkout, payouts via Stripe Connect. Rides the existing `affiliate_enabled`
-entitlement in the plans spec. This is the primary upsell engine from Free → Pro.
+### 7.2 Affiliate program (Pro-only)
+
+Pro creators can let others promote their products for a commission:
+
+- affiliate links per product,
+- configurable commission %,
+- attribution captured at checkout,
+- payouts via Stripe Connect.
+
+Rides the `affiliates.enabled` entitlement from the plans spec. This is the
+**primary upsell from Free → Pro**: a growing Free creator who wants a promotion
+network has a concrete, revenue-driven reason to upgrade.
 
 ---
 
-## 7. V1 MVP Scope
+## 8. What a buyer gets (the after-the-sale relationship)
+
+The sale is the *start*, not the end. A buyer's account gives them:
+
+- A **library** of everything they've purchased, across all creators.
+- **Lifetime access** to each product, including every future version.
+- **Re-download** any time (no "the link expired" dead ends).
+- **New-version notifications** by email.
+
+> **Open decision (see §12):** do buyers need a full account, or is
+> *email + a signed download token* enough for a first purchase? This shapes the
+> whole delivery UX and is deferred to the product spec.
+
+---
+
+## 9. V1 MVP scope
+
+Built strictly in this order; nothing past this list is committed.
 
 ```text
-Auth + plans (built, not yet wired)
-    ↓
-Products: upload to R2, plan-gated (storage_limit, max_products)
-    ↓
-Links: shareable payment link per product → Stripe Checkout
-    ↓
-Auto-delivery: Stripe webhook (checkout.completed) → grant access → presigned R2 URL
-    ↓
-Versioning + buyer email notifications
-    ↓
-Ship → get feedback from potential customers → iterate on what to work on next
+1. Auth + plans                         ← built, not yet wired to products
+2. Products: upload to R2               ← plan-gated by storage + max_products
+3. Links: one payment link per product  → Stripe Checkout
+4. Auto-delivery                        → Stripe webhook (checkout.completed)
+                                          → grant access → presigned R2 URL
+5. Versioning + buyer email notifications
+6. Ship → gather feedback → let feedback drive what's next
 ```
 
-Post-MVP, everything is driven by customer feedback. Nothing past this list is
-committed.
+Post-MVP, **everything is customer-feedback-driven.** We do not pre-commit roadmap
+beyond this loop.
 
 ---
 
-## 8. Idea Log
+## 10. Guardrails / principles
 
-> Unstructured capture area. Add anything — features, product ideas, risks,
-> pricing experiments — no matter how rough. Date each entry. We triage later.
+Short list of things we've decided *not* to compromise on, so future sessions
+don't have to relitigate them:
 
-- (2026-08-11) First entries live in §1–§7 above; this section is the
-  append-only scratchpad going forward.
+- **Free stays genuinely usable.** The core loop is never paywalled. (plans AD-02)
+- **Format-agnostic.** We never assume a file type; "any digital good" is the promise.
+- **Minimal external surface.** R2 + Stripe (+ an email provider, TBD). Resist adding more.
+- **Server-side is the source of truth.** Plan, ownership, and fees are always
+  enforced server-side; the frontend and the token are UX hints, never authority.
+- **Money is never floating-point.** Integer minor units + basis points. (plans §26)
+- **Narrow beats broad.** A feature earns its place only by strengthening
+  *link-in → delivery-out*.
 
 ---
 
-## 9. Open Questions / Decisions
+## 11. Idea Log
 
-| # | Question | Status |
-|---|---|---|
-| 1 | Transactional email provider (Resend / SES / Mailgun / Postmark) | OPEN — required by auth spec + version notifications |
-| 2 | Delivery mechanics: download page vs emailed link; download-link expiry rules | OPEN — for product spec |
-| 3 | Buyer identity model: do buyers need accounts, or is email + signed download token enough? | OPEN — for product spec |
-| 4 | Plan limits for storage/size per file type (any-digital means arbitrary formats) | OPEN — for product spec |
+> Append-only scratchpad. Anything — features, risks, pricing experiments,
+> half-thoughts. Date each entry. We triage later.
+
+- (2026-08-11) Initial vision captured in §1–§9.
+- (2026-08-13) Vision rewritten for clarity and aligned to the two backend specs.
+  Corrected the pricing statement (Free = $0, Pro = $19; earlier "$19–$49 Free/Pro"
+  was wrong per the plans spec). Added explicit buyer-side section (§8) and
+  guardrails (§10). Flagged fee-resolution-from-token as a security decision (§5.2).
+
+---
+
+## 12. Open questions / decisions
+
+| # | Question | Status | Owner spec |
+|---|---|---|---|
+| 1 | Transactional email provider (Resend / SES / Mailgun / Postmark) | **OPEN** — blocks email verification, password reset, and version notifications | auth + product |
+| 2 | Delivery mechanics: on-platform download page vs. emailed link; download-link expiry rules | **OPEN** | product |
+| 3 | Buyer identity: full account vs. email + signed download token for first purchase | **OPEN** | product |
+| 4 | Per-file-type storage/size nuances (any-digital ⇒ arbitrary formats) | **OPEN** | product |
+| 5 | Register response: adopt generic `201` + inbox-differentiated email to close the account-enumeration gap (auth spec §6.1 flags this) | **OPEN — recommend closing** | auth |
+| 6 | Fee resolution + privileged actions during a stale downgrade window: confirm these read the subscription record, not the JWT `plan_key` | **OPEN — recommend confirming** | plans |
+
+---
+
+## 13. Glossary
+
+| Term | Meaning |
+|---|---|
+| **Product** | A seller's item. Has one or more versions. |
+| **Product version** | A specific uploaded revision of a product, each with its own R2 key. |
+| **Payment link** | The shareable URL for a product; drives Stripe Checkout. |
+| **Purchase** | The binding of a buyer to a *product* (not a version) — grants lifetime access. |
+| **Library** | A buyer's collection of all purchased products. |
+| **Platform fee** | The % linkMe takes per sale via Stripe Connect (5% Free / 1% Pro). |
+| **Entitlement** | A capability or limit granted by a plan (e.g. `products.max_active`). |
+| **Effective plan** | The authoritative server-side plan for a user right now (source of truth over any token snapshot). |
