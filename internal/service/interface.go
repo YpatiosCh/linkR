@@ -102,3 +102,18 @@ type EmailService interface {
 	// lets the recipient set a new password using token.
 	SendPasswordResetEmail(ctx context.Context, email string, token string) error
 }
+
+// SessionRevoker marks sessions as revoked in the shared, fast-path
+// revocation store (Redis) that middleware.RequireAuth checks on every
+// request, so a revoked session's access token stops working immediately
+// rather than lingering until its natural JWT expiry. Called by AuthService
+// and UserService right after the corresponding repository.SessionRepository
+// revoke call succeeds. Satisfied by *redis.SessionRevocationStore
+// (linkMe/internal/redis) — declared here, not imported from there, so this
+// package stays decoupled from Redis and easily testable with a fake.
+type SessionRevoker interface {
+	// RevokeSession marks a single session as revoked.
+	RevokeSession(ctx context.Context, sessionID uuid.UUID) error
+	// RevokeSessions marks every session in sessionIDs as revoked.
+	RevokeSessions(ctx context.Context, sessionIDs []uuid.UUID) error
+}

@@ -8,7 +8,7 @@ email actually get sent?**
 
 ## 1. Prerequisites
 
-1. Start Postgres:
+1. Start Postgres and Redis (session revocation + rate limiting need Redis too):
    ```bash
    docker-compose up -d
    ```

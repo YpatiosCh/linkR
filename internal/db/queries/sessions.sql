@@ -9,14 +9,14 @@ SELECT * FROM sessions WHERE refresh_token_hash = $1;
 -- name: MarkSessionConsumed :exec
 UPDATE sessions SET revoked_at = now() WHERE id = $1;
 
--- name: RevokeSessionFamily :exec
-UPDATE sessions SET revoked_at = now() WHERE token_family_id = $1 AND revoked_at IS NULL;
+-- name: RevokeSessionFamily :many
+UPDATE sessions SET revoked_at = now() WHERE token_family_id = $1 AND revoked_at IS NULL RETURNING id;
 
 -- name: RevokeSession :exec
 UPDATE sessions SET revoked_at = now() WHERE id = $1;
 
--- name: RevokeAllSessionsForUser :exec
-UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL;
+-- name: RevokeAllSessionsForUser :many
+UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL RETURNING id;
 
--- name: RevokeOtherSessionsForUser :exec
-UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id != $2 AND revoked_at IS NULL;
+-- name: RevokeOtherSessionsForUser :many
+UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id != $2 AND revoked_at IS NULL RETURNING id;

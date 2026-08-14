@@ -337,7 +337,7 @@ Failure behavior:
 
 ---
 
-# 9. Token and Session Architecture ✅ DONE — JWT access tokens (HS256, 15-min, claims: user_id/session_id/plan_key) via `internal/utils/jwttoken`; opaque refresh tokens (32-byte random, SHA-256 hashed, 30-day expiry, token-family lineage) via `internal/utils/token`; full rotation + reuse detection in `AuthService.Refresh`
+# 9. Token and Session Architecture ✅ DONE — JWT access tokens (HS256, 15-min, claims: user_id/session_id/plan_key) via `internal/utils/jwttoken`; opaque refresh tokens (32-byte random, SHA-256 hashed, 30-day expiry, token-family lineage) via `internal/utils/token`; full rotation + reuse detection in `AuthService.Refresh`; access tokens are also checked against a Redis-backed revocation store on every request (`internal/redis`), so logout invalidates them immediately instead of only at natural expiry
 
 Use short-lived access credentials and long-lived refresh/session credentials.
 
@@ -355,7 +355,7 @@ Refresh Token
 obtain new access token
 ```
 
-> **Decision (access token format):** JWT — HS256 via `golang-jwt/jwt/v5` (vetted library, per §26/§46.19). ✅ Implemented in `internal/utils/jwttoken`. Short lifetime 15 min. Claims: `user_id`, `session_id`, `plan_key`. Stateless verification in `RequireAuth` middleware — no DB lookup on the request hot path (see §22; plans spec §16.1/§18.1). Refresh tokens remain opaque + DB-hashed.
+> **Decision (access token format):** JWT — HS256 via `golang-jwt/jwt/v5` (vetted library, per §26/§46.19). ✅ Implemented in `internal/utils/jwttoken`. Short lifetime 15 min. Claims: `user_id`, `session_id`, `plan_key`. Signature + expiry verification in `RequireAuth` middleware is stateless — no *Postgres* lookup on the request hot path (see §22; plans spec §16.1/§18.1). **Revision:** `RequireAuth` also checks session revocation on every request now, via a Redis `EXISTS` (`internal/redis.SessionRevocationStore`, `internal/middleware/auth.go`) — a logged-out access token is rejected immediately rather than remaining valid until its natural 15-min expiry. This closes the "logout doesn't actually invalidate the access token" gap that the original stateless-only design accepted; the fast-path store is Redis (shared across every instance, self-expiring, no per-instance in-memory state), not the primary database, so the original "no DB lookup" intent — cheap, horizontally-scalable, no query fan-out — still holds. Refresh tokens remain opaque + DB-hashed.
 
 Access tokens should have a short lifetime, for example 10–15 minutes.
 
@@ -445,7 +445,7 @@ Do not return the raw refresh token in JSON if it is being delivered as an HttpO
 
 ---
 
-# 12. Logout ✅ DONE — `POST /api/v1/auth/logout`; RequireAuth → reads sessionID from JWT claims → RevokeSession → clear cookies → 204. Idempotent.
+# 12. Logout ✅ DONE — `POST /api/v1/auth/logout`; RequireAuth → reads sessionID from JWT claims → RevokeSession (Postgres) + SessionRevoker.RevokeSession (Redis, immediate access-token invalidation — see §9) → clear cookies → 204. Idempotent.
 
 ```http
 POST /api/v1/auth/logout
@@ -1050,19 +1050,23 @@ Never use:
 
 ---
 
-# 27. Rate Limiting ✅ DONE — per-IP fixed-window, in-process, implemented in `internal/middleware/ratelimit/`. `New(limit, window)` returns a middleware directly; each call site gets its own counter store. Applied to every route in `internal/router/router.go`:
+# 27. Rate Limiting ✅ DONE — per-IP fixed-window, **Redis-backed** (shared across every server instance), implemented in `internal/redis/ratelimit.go`. `NewRateLimiter(client, name, limit, window)` returns a middleware; counters live in Redis (`ratelimit:{name}:{ip}`, `INCR` + `EXPIRE`-on-first-hit) instead of the in-process map the first implementation used — a single instance's Go map doesn't limit anything once there's more than one instance. Applied to every route in `internal/router/router.go`:
 
 ```text
-POST /api/v1/auth/register          5 / hour
-POST /api/v1/auth/login            10 / 15 min
-POST /api/v1/auth/refresh          60 / 15 min   (machine-initiated, multiple tabs/devices)
-POST /api/v1/auth/logout           10 / 15 min
-POST /api/v1/auth/logout-all        5 / 15 min
-GET  /api/v1/me                    60 / 15 min
-POST /api/v1/me/password/change     5 / 15 min
+POST /api/v1/auth/register                       5 / hour
+POST /api/v1/auth/login                         10 / 15 min
+POST /api/v1/auth/refresh                       60 / 15 min   (machine-initiated, multiple tabs/devices)
+POST /api/v1/auth/logout                        10 / 15 min
+POST /api/v1/auth/logout-all                     5 / 15 min
+POST /api/v1/auth/email/verification/request     5 / hour
+POST /api/v1/auth/email/verification/verify     10 / 15 min
+POST /api/v1/auth/password/reset/request         5 / hour
+POST /api/v1/auth/password/reset/confirm        10 / 15 min
+GET  /api/v1/me                                 60 / 15 min
+POST /api/v1/me/password/change                  5 / 15 min
 ```
 
-Rate limit runs before `RequireAuth` on authenticated routes — 429 before JWT verification. Responds immediately with 429 `TOO_MANY_REQUESTS`. IP extracted from `X-Real-IP` (reverse proxy) then `RemoteAddr`. Still missing: account/email-based controls, limits on password-reset and email-verification endpoints (pending those features).
+Rate limit runs before `RequireAuth` on authenticated routes — 429 before JWT verification. Responds immediately with 429 `TOO_MANY_REQUESTS`. IP extracted from `X-Real-IP` (reverse proxy) then `RemoteAddr`. Still missing: account/email-based controls (only per-IP today).
 
 ---
 

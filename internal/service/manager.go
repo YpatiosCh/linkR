@@ -2,6 +2,7 @@ package service
 
 import (
 	"linkMe/config"
+	"linkMe/internal/redis"
 	"linkMe/internal/repository"
 
 	"github.com/resend/resend-go/v3"
@@ -20,9 +21,10 @@ type ServiceManager struct {
 // email service (and any other sub-services) on top of them.
 func NewServiceManager(repos repository.Repository, cfg config.Config) Service {
 	emailService := NewEmailService(resend.NewClient(cfg.ResendAPIKey), cfg)
+	sessionRevoker := redis.NewSessionRevocationStore(cfg.RedisClient)
 	return &ServiceManager{
-		authService:  NewAuthService(repos, cfg, emailService),
-		userService:  NewUserService(repos),
+		authService:  NewAuthService(repos, cfg, emailService, sessionRevoker),
+		userService:  NewUserService(repos, sessionRevoker),
 		emailService: emailService,
 	}
 }

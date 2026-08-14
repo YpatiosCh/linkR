@@ -18,13 +18,14 @@ import (
 // resource.
 type userService struct {
 	repository.Repository
+	sessions SessionRevoker
 }
 
-// NewUserService builds a userService backed by the given repositories,
-// embedding the repository so profile flows can reach all entity
-// repositories and WithinTx directly.
-func NewUserService(repos repository.Repository) *userService {
-	return &userService{Repository: repos}
+// NewUserService builds a userService backed by the given repositories and
+// session revoker, embedding the repository so profile flows can reach all
+// entity repositories and WithinTx directly.
+func NewUserService(repos repository.Repository, sessions SessionRevoker) *userService {
+	return &userService{Repository: repos, sessions: sessions}
 }
 
 // GetMe returns the user identified by userID together with their active
@@ -81,10 +82,20 @@ func (s *userService) ChangePassword(ctx context.Context, userID uuid.UUID, sess
 		return fmt.Errorf("hashing new password: %w", err)
 	}
 
-	return s.WithinTx(ctx, func(ctx context.Context) error {
+	var revokedSessionIDs []uuid.UUID
+	err = s.WithinTx(ctx, func(ctx context.Context) error {
 		if err := s.AuthIdentity().UpdatePasswordHash(ctx, userID, newHash); err != nil {
 			return err
 		}
-		return s.Session().RevokeOtherSessionsForUser(ctx, userID, sessionID)
+		ids, err := s.Session().RevokeOtherSessionsForUser(ctx, userID, sessionID)
+		if err != nil {
+			return err
+		}
+		revokedSessionIDs = ids
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return s.sessions.RevokeSessions(ctx, revokedSessionIDs)
 }

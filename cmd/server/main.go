@@ -31,6 +31,10 @@ func main() {
 	if cfg.ResendAPIKey == "" {
 		log.Fatal("RESEND_API_KEY is not set")
 	}
+	if err := cfg.RedisClient.Ping(context.Background()).Err(); err != nil {
+		log.Fatal("unable to reach redis")
+	}
+	log.Println("connected to redis")
 
 	pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
 	if err != nil {

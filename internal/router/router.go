@@ -4,7 +4,7 @@ import (
 	"linkMe/config"
 	"linkMe/internal/handlers"
 	"linkMe/internal/middleware"
-	"linkMe/internal/middleware/ratelimit"
+	"linkMe/internal/redis"
 	"net/http"
 	"time"
 )
@@ -16,8 +16,10 @@ import (
 func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 	mux := http.NewServeMux()
 
-	requireAuth := middleware.RequireAuth(cfg.JWTSecret)
-	rl := ratelimit.New
+	requireAuth := middleware.RequireAuth(cfg.JWTSecret, redis.NewSessionRevocationStore(cfg.RedisClient))
+	rl := func(name string, limit int, window time.Duration) func(http.Handler) http.Handler {
+		return redis.NewRateLimiter(cfg.RedisClient, name, limit, window)
+	}
 
 	// Health check — no authentication or rate limiting needed.
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -26,24 +28,24 @@ func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 	})
 
 	// Public auth routes.
-	mux.Handle("POST /api/v1/auth/register", rl(5, time.Hour)(http.HandlerFunc(h.Auth().Register)))
-	mux.Handle("POST /api/v1/auth/login", rl(10, 15*time.Minute)(http.HandlerFunc(h.Auth().Login)))
-	mux.Handle("POST /api/v1/auth/refresh", rl(60, 15*time.Minute)(http.HandlerFunc(h.Auth().Refresh)))
+	mux.Handle("POST /api/v1/auth/register", rl("register", 5, time.Hour)(http.HandlerFunc(h.Auth().Register)))
+	mux.Handle("POST /api/v1/auth/login", rl("login", 10, 15*time.Minute)(http.HandlerFunc(h.Auth().Login)))
+	mux.Handle("POST /api/v1/auth/refresh", rl("refresh", 60, 15*time.Minute)(http.HandlerFunc(h.Auth().Refresh)))
 
 	// Authenticated auth routes.
-	mux.Handle("POST /api/v1/auth/logout", rl(10, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Auth().Logout))))
-	mux.Handle("POST /api/v1/auth/logout-all", rl(5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Auth().LogoutAll))))
+	mux.Handle("POST /api/v1/auth/logout", rl("logout", 10, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Auth().Logout))))
+	mux.Handle("POST /api/v1/auth/logout-all", rl("logout-all", 5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Auth().LogoutAll))))
 
 	// Public email verification and password reset routes — the opaque
 	// token in the request body is the credential, not a bearer token.
-	mux.Handle("POST /api/v1/auth/email/verification/request", rl(5, time.Hour)(http.HandlerFunc(h.Auth().RequestEmailVerification)))
-	mux.Handle("POST /api/v1/auth/email/verification/verify", rl(10, 15*time.Minute)(http.HandlerFunc(h.Auth().VerifyEmail)))
-	mux.Handle("POST /api/v1/auth/password/reset/request", rl(5, time.Hour)(http.HandlerFunc(h.Auth().RequestPasswordReset)))
-	mux.Handle("POST /api/v1/auth/password/reset/confirm", rl(10, 15*time.Minute)(http.HandlerFunc(h.Auth().ResetPassword)))
+	mux.Handle("POST /api/v1/auth/email/verification/request", rl("email-verify-request", 5, time.Hour)(http.HandlerFunc(h.Auth().RequestEmailVerification)))
+	mux.Handle("POST /api/v1/auth/email/verification/verify", rl("email-verify-verify", 10, 15*time.Minute)(http.HandlerFunc(h.Auth().VerifyEmail)))
+	mux.Handle("POST /api/v1/auth/password/reset/request", rl("password-reset-request", 5, time.Hour)(http.HandlerFunc(h.Auth().RequestPasswordReset)))
+	mux.Handle("POST /api/v1/auth/password/reset/confirm", rl("password-reset-confirm", 10, 15*time.Minute)(http.HandlerFunc(h.Auth().ResetPassword)))
 
 	// Authenticated current-user routes.
-	mux.Handle("GET /api/v1/me", rl(60, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().GetMe))))
-	mux.Handle("POST /api/v1/me/password/change", rl(5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().ChangePassword))))
+	mux.Handle("GET /api/v1/me", rl("me", 60, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().GetMe))))
+	mux.Handle("POST /api/v1/me/password/change", rl("me-password-change", 5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().ChangePassword))))
 
 	// Global middleware: security headers run first (outermost), then CORS.
 	return middleware.SecurityHeaders(cfg.AppEnv)(

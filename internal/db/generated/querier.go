@@ -28,10 +28,10 @@ type Querier interface {
 	MarkEmailVerificationTokenConsumed(ctx context.Context, id uuid.UUID) error
 	MarkPasswordResetTokenConsumed(ctx context.Context, id uuid.UUID) error
 	MarkSessionConsumed(ctx context.Context, id uuid.UUID) error
-	RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error
-	RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) error
+	RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
+	RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) ([]uuid.UUID, error)
 	RevokeSession(ctx context.Context, id uuid.UUID) error
-	RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) error
+	RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) ([]uuid.UUID, error)
 	UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error
 	UpdatePasswordHash(ctx context.Context, arg UpdatePasswordHashParams) error
 }

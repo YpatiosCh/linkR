@@ -1,6 +1,9 @@
 package middleware_test
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +15,17 @@ import (
 )
 
 const middlewareSecret = "middleware-test-secret-at-least-32-bytes!!"
+
+// fakeSessionChecker is a fake middleware.SessionRevocationChecker. The zero
+// value reports every session as not revoked with no error.
+type fakeSessionChecker struct {
+	revoked bool
+	err     error
+}
+
+func (f *fakeSessionChecker) IsSessionRevoked(ctx context.Context, sessionID uuid.UUID) (bool, error) {
+	return f.revoked, f.err
+}
 
 // issueTestToken issues a real JWT using the jwttoken package so middleware
 // tests exercise the full verification path rather than relying on stubs.
@@ -51,7 +65,7 @@ func TestRequireAuth_WithBearerToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	rec := httptest.NewRecorder()
-	middleware.RequireAuth(middlewareSecret)(inner).ServeHTTP(rec, req)
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{})(inner).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d; body: %s", rec.Code, rec.Body)
@@ -75,7 +89,7 @@ func TestRequireAuth_WithCookie(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	req.AddCookie(&http.Cookie{Name: "access_token", Value: tok})
 	rec := httptest.NewRecorder()
-	middleware.RequireAuth(middlewareSecret)(sentinel).ServeHTTP(rec, req)
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{})(sentinel).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200 with valid cookie token, got %d", rec.Code)
@@ -94,7 +108,7 @@ func TestRequireAuth_BearerTakesPrecedenceOverCookie(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.AddCookie(&http.Cookie{Name: "access_token", Value: "some-other-value"})
 	rec := httptest.NewRecorder()
-	middleware.RequireAuth(middlewareSecret)(sentinel).ServeHTTP(rec, req)
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{})(sentinel).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200 when valid Bearer is present, got %d", rec.Code)
@@ -105,7 +119,7 @@ func TestRequireAuth_MissingToken(t *testing.T) {
 	sentinel := &sentinelHandler{}
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	rec := httptest.NewRecorder()
-	middleware.RequireAuth(middlewareSecret)(sentinel).ServeHTTP(rec, req)
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{})(sentinel).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 when no token is provided, got %d", rec.Code)
@@ -120,7 +134,7 @@ func TestRequireAuth_InvalidToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	req.Header.Set("Authorization", "Bearer this.is.not.a.valid.jwt")
 	rec := httptest.NewRecorder()
-	middleware.RequireAuth(middlewareSecret)(sentinel).ServeHTTP(rec, req)
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{})(sentinel).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 for invalid JWT, got %d", rec.Code)
@@ -138,13 +152,59 @@ func TestRequireAuth_WrongSecret(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+tok)
 	rec := httptest.NewRecorder()
 	// Verify with a different secret than the one used to sign.
-	middleware.RequireAuth("different-secret-that-is-at-least-32-bytes!")(sentinel).ServeHTTP(rec, req)
+	middleware.RequireAuth("different-secret-that-is-at-least-32-bytes!", &fakeSessionChecker{})(sentinel).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 when token signed with wrong key, got %d", rec.Code)
 	}
 	if sentinel.called {
 		t.Error("inner handler must not be called when signature verification fails")
+	}
+}
+
+func TestRequireAuth_RevokedSession(t *testing.T) {
+	tok := issueTestToken(t, uuid.New(), uuid.New(), "free")
+	sentinel := &sentinelHandler{}
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{revoked: true})(sentinel).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a revoked session, got %d", rec.Code)
+	}
+	if sentinel.called {
+		t.Error("inner handler must not be called for a revoked session")
+	}
+	type errBody struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	var body errBody
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response body: %v", err)
+	}
+	if body.Error.Code != "SESSION_REVOKED" {
+		t.Errorf("expected SESSION_REVOKED code, got %q", body.Error.Code)
+	}
+}
+
+func TestRequireAuth_SessionCheckError(t *testing.T) {
+	tok := issueTestToken(t, uuid.New(), uuid.New(), "free")
+	sentinel := &sentinelHandler{}
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{err: errors.New("redis unreachable")})(sentinel).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 when the revocation check fails, got %d", rec.Code)
+	}
+	if sentinel.called {
+		t.Error("inner handler must not be called when the revocation check fails")
 	}
 }
 
@@ -163,7 +223,7 @@ func TestRequireAuth_EmptyBearerHeader(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
 	req.Header.Set("Authorization", "Bearer ")
 	rec := httptest.NewRecorder()
-	middleware.RequireAuth(middlewareSecret)(sentinel).ServeHTTP(rec, req)
+	middleware.RequireAuth(middlewareSecret, &fakeSessionChecker{})(sentinel).ServeHTTP(rec, req)
 
 	// An empty string after stripping "Bearer " is still an empty token string
 	// so the middleware treats it as missing → 401.

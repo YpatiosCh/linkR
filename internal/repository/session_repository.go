@@ -95,13 +95,15 @@ func (r *sessionRepository) MarkSessionConsumed(ctx context.Context, id uuid.UUI
 
 // RevokeSessionFamily sets revoked_at = now() on every non-revoked session
 // belonging to the given token family. Used when a consumed refresh token is
-// reused, signalling a possible token theft. Any database error is wrapped.
-func (r *sessionRepository) RevokeSessionFamily(ctx context.Context, familyID uuid.UUID) error {
+// reused, signalling a possible token theft. Returns the IDs of the revoked
+// sessions. Any database error is wrapped.
+func (r *sessionRepository) RevokeSessionFamily(ctx context.Context, familyID uuid.UUID) ([]uuid.UUID, error) {
 	q := r.querier(ctx)
-	if err := q.RevokeSessionFamily(ctx, familyID); err != nil {
-		return fmt.Errorf("revoking session family: %w", err)
+	ids, err := q.RevokeSessionFamily(ctx, familyID)
+	if err != nil {
+		return nil, fmt.Errorf("revoking session family: %w", err)
 	}
-	return nil
+	return ids, nil
 }
 
 // RevokeSession sets revoked_at = now() on the session with the given ID,
@@ -116,27 +118,31 @@ func (r *sessionRepository) RevokeSession(ctx context.Context, id uuid.UUID) err
 }
 
 // RevokeAllSessionsForUser sets revoked_at = now() on every non-revoked
-// session belonging to the given user, used during logout-all.
-func (r *sessionRepository) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error {
+// session belonging to the given user, used during logout-all. Returns the
+// IDs of the revoked sessions.
+func (r *sessionRepository) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
 	q := r.querier(ctx)
-	if err := q.RevokeAllSessionsForUser(ctx, userID); err != nil {
-		return fmt.Errorf("revoking all sessions for user: %w", err)
+	ids, err := q.RevokeAllSessionsForUser(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("revoking all sessions for user: %w", err)
 	}
-	return nil
+	return ids, nil
 }
 
 // RevokeOtherSessionsForUser sets revoked_at = now() on every non-revoked
 // session belonging to the given user except keepSessionID, used during
-// password change to keep the current session alive.
-func (r *sessionRepository) RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) error {
+// password change to keep the current session alive. Returns the IDs of the
+// revoked sessions.
+func (r *sessionRepository) RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) ([]uuid.UUID, error) {
 	q := r.querier(ctx)
-	if err := q.RevokeOtherSessionsForUser(ctx, db.RevokeOtherSessionsForUserParams{
+	ids, err := q.RevokeOtherSessionsForUser(ctx, db.RevokeOtherSessionsForUserParams{
 		UserID: userID,
 		ID:     keepSessionID,
-	}); err != nil {
-		return fmt.Errorf("revoking other sessions for user: %w", err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("revoking other sessions for user: %w", err)
 	}
-	return nil
+	return ids, nil
 }
 
 // dbSessionToDomain maps a sqlc db.Session row to a domain models.Session,

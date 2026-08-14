@@ -41,6 +41,8 @@ Companion documents (per-feature sources of truth, see [§6](#6-feature-specific
 | IDs | `github.com/google/uuid` (UUID PKs; sqlc override maps `uuid` → `uuid.UUID`) |
 | Passwords | Argon2id via `golang.org/x/crypto` (`pkg/hash`) |
 | Env loading | `github.com/joho/godotenv` (`pkg/dotenv`) |
+| Shared fast-path state | Redis 7 (via `docker-compose.yml`, port `6380`), `github.com/redis/go-redis/v9` (`internal/redis`) — session revocation + rate limiting, shared across every server instance |
+| Email | `github.com/resend/resend-go/v3` (`internal/service/email_service.go`) |
 
 The dependency set is intentionally minimal. **Adding a dependency is an
 architecture decision — ask before adding.** (Rule G1)
@@ -68,10 +70,9 @@ below it. Nothing ever depends upward or skips a layer.
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                     internal/middleware  (HTTP middleware)               │
-│   auth.go — RequireAuth(jwtSecret), AuthClaims(r)                       │
+│   auth.go — RequireAuth(jwtSecret, sessions), AuthClaims(r)             │
 │   cors.go — CORS(allowedOrigins): allowlist, echo origin, preflight 204 │
 │   securityheaders.go — SecurityHeaders(appEnv): nosniff/DENY/CSP/HSTS  │
-│   ratelimit/ — New(limit, window): per-IP fixed-window middleware        │
 └──────────────────────────────────────┬──────────────────────────────────┘
                                        │  wraps
                                        ▼
@@ -107,6 +108,10 @@ below it. Nothing ever depends upward or skips a layer.
 Shared support packages (imported by any of the above, never importing them back):
    internal/msgs    sentinel errors (the contract between layers)
    internal/utils   internal helpers (response, validate, token, jwttoken, cookies)
+   internal/redis   the only package touching github.com/redis/go-redis/v9 — session
+                    revocation + rate limiting, shared across every server instance;
+                    consumers (middleware, router, service) depend on the *redis.Client
+                    living on config.Config, never on internal/redis's callers
    pkg              self-contained helpers (dotenv, hash)
 ```
 
@@ -652,7 +657,7 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-14 (email verification + password reset). Update this section whenever a milestone lands.
+Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
 
 ### Implemented
 
@@ -660,12 +665,22 @@ Snapshot as of 2026-08-14 (email verification + password reset). Update this sec
   composition root (repository → service → handler managers), delegates all route/middleware
   wiring to `router.SetupRoutes(h, cfg)`, listen on `:8080`.
 - **Config**: `config/config.go` — `Config{DatabaseURL, JWTSecret, AllowedOrigins []string,
-  AppEnv, ResendAPIKey, EmailFrom, FrontendURL string}`. `CORS_ALLOWED_ORIGINS`
-  (comma-separated, default `http://localhost:3000`); `APP_ENV` (default
-  `"development"`); `FRONTEND_URL` (default `http://localhost:3000`). Passed to
-  constructors via struct — never as individual args. `cmd/server/main.go`
-  validates `DatabaseURL`, `JWTSecret`, and `ResendAPIKey` are non-empty at
-  startup (`log.Fatal` otherwise) — `EmailFrom`/`FrontendURL` are not validated.
+  AppEnv, ResendAPIKey, EmailFrom, FrontendURL string; RedisClient *redis.Client}`.
+  `CORS_ALLOWED_ORIGINS` (comma-separated, default `http://localhost:3000`); `APP_ENV`
+  (default `"development"`); `FRONTEND_URL` (default `http://localhost:3000`);
+  `REDIS_ADDR` (default `localhost:6380`). Passed to constructors via struct —
+  never as individual args. `cmd/server/main.go` validates `DatabaseURL`,
+  `JWTSecret`, and `ResendAPIKey` are non-empty, and `Ping`s `RedisClient`, all
+  at startup (`log.Fatal` otherwise) — `EmailFrom`/`FrontendURL` are not validated.
+  `RedisClient` is a **deliberate, documented exception** to "Config holds only
+  primitive values": session revocation (middleware), rate limiting (router),
+  and two services all need the *same* client, and threading it through every
+  constructor individually was worse than holding it once, alongside the rest
+  of the shared config. `pgxpool.Pool` and the Resend client are **not** given
+  the same treatment — each has exactly one consumer
+  (`repository.NewRepoManager`, `service.NewServiceManager`), so there's no
+  fan-out problem to solve for them; don't move them into `Config` without a
+  reason that actually applies to them.
 - **Schema (migrations, all 8 tables)**: users, auth_identities, email_verification_tokens,
   password_reset_tokens, plans, user_subscriptions, audit_events, sessions.
 - **Queries + generated code**: users (create/get-by-email/get-by-id/update-email-verified-at),
@@ -711,7 +726,22 @@ Snapshot as of 2026-08-14 (email verification + password reset). Update this sec
     Resend-backed (`emailService`); `RESEND_API_KEY` is required at startup
     (`cmd/server/main.go` fails fast if unset), no dev/noop fallback; consumed
     by `AuthService` via a constructor dependency
-    (`NewAuthService(repos, cfg, emailSvc)`).
+    (`NewAuthService(repos, cfg, emailSvc, sessions)`).
+  - `SessionRevoker` (`RevokeSession`/`RevokeSessions`) — the write side of
+    session revocation (see Middleware below for the read side). Both
+    `AuthService` and `UserService` take one as a constructor dependency and
+    call it immediately after the corresponding
+    `repository.SessionRepository` revoke call succeeds, at all 5 points a
+    session can be invalidated: `Logout`, `LogoutAll`, `Refresh`'s
+    reuse-detection branch, `ResetPassword` (all of these on `AuthService`),
+    and `ChangePassword` (on `UserService`). `RevokeSessionFamily`/
+    `RevokeAllSessionsForUser`/`RevokeOtherSessionsForUser` on
+    `repository.SessionRepository` are `:many` queries with `RETURNING id`
+    specifically so the service layer knows which session IDs to also mark
+    in the revocation store — a plain `:exec` UPDATE wouldn't report them.
+    Satisfied by `*redis.SessionRevocationStore` (`internal/redis`),
+    constructed once in `ServiceManager.NewServiceManager` from
+    `cfg.RedisClient` and passed to both services.
 - **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll/
   RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword) + `UserHandler`
   (GetMe/ChangePassword — renamed from `MeHandler` since it will grow to cover profile
@@ -725,11 +755,28 @@ Snapshot as of 2026-08-14 (email verification + password reset). Update this sec
   `UserHandler.ChangePassword`. Both `UserHandler` methods read claims via
   `middleware.AuthClaims(r)`.
 - **Middleware** (`internal/middleware/`):
-  - `auth.go` — `RequireAuth(jwtSecret)` (Bearer header → cookie fallback, JWT verify, claims injection) + `AuthClaims(r)`
+  - `auth.go` — `RequireAuth(jwtSecret, sessions)` (Bearer header → cookie fallback, JWT verify,
+    **session-revocation check**, claims injection) + `AuthClaims(r)`. After JWT verification
+    succeeds, it calls `sessions.IsSessionRevoked(ctx, claims.SessionID)` (the
+    `SessionRevocationChecker` interface, declared here and satisfied structurally by
+    `*redis.SessionRevocationStore`) — a revoked session gets `401 SESSION_REVOKED`
+    immediately, rather than waiting out the JWT's remaining lifetime. This overrides the
+    "no DB lookup on the request hot path" decision from auth spec §9: the check still
+    isn't a *Postgres* lookup (that tradeoff holds), it's a Redis `EXISTS` — see
+    `internal/redis` above for why that's the fix instead of an in-process cache
+    (multi-instance safe) or a Postgres query (adds real DB load to every request).
   - `cors.go` — `CORS(allowedOrigins)`: explicit allowlist, echoes origin (never `*`), `Vary: Origin`, preflight 204
   - `securityheaders.go` — `SecurityHeaders(appEnv)`: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, `default-src 'none'` CSP, HSTS (production only)
-  - `ratelimit/ratelimit.go` — `New(limit, window)`: returns per-IP fixed-window middleware; each call creates its own isolated counter store
-- **Router** (`internal/router/router.go`): `SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler` — creates all rate limiters, wires per-route middleware chains, wraps mux in global security headers + CORS middleware, returns the assembled handler.
+- **Rate limiting** (`internal/redis/ratelimit.go`, not `internal/middleware/` — see
+  `internal/redis` above): `NewRateLimiter(client, name, limit, window)` — per-IP fixed-window
+  middleware, `INCR` + `EXPIRE`-on-first-hit against Redis, shared across every instance.
+  `name` namespaces the counter per route (`ratelimit:{name}:{ip}`) since the counter store
+  is shared now rather than one isolated Go map per call site.
+- **Router** (`internal/router/router.go`): `SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler` —
+  builds `requireAuth`/the rate-limiter factory from `cfg.RedisClient` (unchanged signature —
+  the client travels on `cfg`, which `SetupRoutes` already receives), wires per-route
+  middleware chains, wraps mux in global security headers + CORS middleware, returns the
+  assembled handler.
 - **JWT tokens**: `internal/utils/jwttoken` — HS256, 15-min lifetime, claims:
   UserID/SessionID/PlanKey. `Issue` + `Verify` (rejects expired, wrong key, alg:none).
 - **Routes** (all wired in `internal/router/router.go`, global middleware: security headers + CORS):
@@ -754,7 +801,8 @@ Snapshot as of 2026-08-14 (email verification + password reset). Update this sec
   - `test/service/email_service_test.go` — SendVerificationEmail/SendPasswordResetEmail (success + non-2xx) against a fake `http.RoundTripper`, no network access
   - `test/handlers/auth_handler_test.go` — Register/Login/Refresh/Logout/LogoutAll/RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword (happy paths + key error paths)
   - `test/handlers/user_handler_test.go` — GetMe/ChangePassword (happy paths + key error paths)
-  - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer), AuthClaims outside protected route
+  - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer/revoked-session/revocation-check-error), AuthClaims outside protected route
+  - `test/redis` — `SessionRevocationStore` (not-revoked-by-default, single/bulk revoke), `NewRateLimiter` (allow-under-limit, reject-over-limit, per-name isolation, window reset) — all against `miniredis`, no live Redis needed for the suite
   - `test/jwttoken` — Issue/Verify roundtrip, wrong key, tampered, malformed, alg:none, duration constant, distinct tokens
   - `test/hash`, `test/token`, `test/validate`
 - **Helpers**: `pkg/dotenv`, `pkg/hash` (Argon2id PHC), `utils/token` (opaque token + SHA-256),

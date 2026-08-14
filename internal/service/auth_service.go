@@ -27,15 +27,17 @@ const (
 // repository with the business rules for authentication.
 type authService struct {
 	repository.Repository
-	cfg   config.Config
-	email EmailService
+	cfg      config.Config
+	email    EmailService
+	sessions SessionRevoker
 }
 
 // NewAuthService builds an authService backed by the given repositories,
-// application config, and email service, embedding the repository so auth
-// flows can reach all entity repositories and WithinTx directly.
-func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService) *authService {
-	return &authService{Repository: repos, cfg: cfg, email: emailSvc}
+// application config, email service, and session revoker, embedding the
+// repository so auth flows can reach all entity repositories and WithinTx
+// directly.
+func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService, sessions SessionRevoker) *authService {
+	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions}
 }
 
 // Register handles user registration: it normalizes and validates the input,
@@ -198,7 +200,9 @@ func (s *authService) Refresh(ctx context.Context, rawRefreshToken string) (mode
 	// rotation (or explicitly revoked). Presenting its token is a reuse
 	// signal — revoke the whole token family defensively.
 	if session.RevokedAt != nil {
-		_ = s.Session().RevokeSessionFamily(ctx, session.TokenFamilyID)
+		if ids, err := s.Session().RevokeSessionFamily(ctx, session.TokenFamilyID); err == nil {
+			_ = s.sessions.RevokeSessions(ctx, ids)
+		}
 		return models.User{}, models.TokenPair{}, msgs.ErrTokenReuseDetected
 	}
 
@@ -239,19 +243,30 @@ func (s *authService) Refresh(ctx context.Context, rawRefreshToken string) (mode
 	return user, pair, nil
 }
 
-// Logout revokes the session with the given ID, invalidating its refresh token.
-// It is idempotent: revoking an already-revoked session succeeds silently.
+// Logout revokes the session with the given ID, invalidating its refresh
+// token and immediately invalidating its access token via the shared
+// session-revocation store. It is idempotent: revoking an already-revoked
+// session succeeds silently.
 func (s *authService) Logout(ctx context.Context, sessionID uuid.UUID) error {
 	if err := s.Session().RevokeSession(ctx, sessionID); err != nil {
+		return fmt.Errorf("logout: %w", err)
+	}
+	if err := s.sessions.RevokeSession(ctx, sessionID); err != nil {
 		return fmt.Errorf("logout: %w", err)
 	}
 	return nil
 }
 
-// LogoutAll revokes every active session belonging to userID, signing the user
-// out of all devices and invalidating all refresh-token families.
+// LogoutAll revokes every active session belonging to userID, signing the
+// user out of all devices, invalidating all refresh-token families, and
+// immediately invalidating every access token via the shared
+// session-revocation store.
 func (s *authService) LogoutAll(ctx context.Context, userID uuid.UUID) error {
-	if err := s.Session().RevokeAllSessionsForUser(ctx, userID); err != nil {
+	ids, err := s.Session().RevokeAllSessionsForUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("logout all: %w", err)
+	}
+	if err := s.sessions.RevokeSessions(ctx, ids); err != nil {
 		return fmt.Errorf("logout all: %w", err)
 	}
 	return nil
@@ -411,15 +426,25 @@ func (s *authService) ResetPassword(ctx context.Context, rawToken string, newPas
 		return fmt.Errorf("hashing new password: %w", err)
 	}
 
-	return s.WithinTx(ctx, func(ctx context.Context) error {
+	var revokedSessionIDs []uuid.UUID
+	err = s.WithinTx(ctx, func(ctx context.Context) error {
 		if err := s.AuthIdentity().UpdatePasswordHash(ctx, t.UserID, newHash); err != nil {
 			return err
 		}
 		if err := s.PasswordResetToken().MarkPasswordResetTokenConsumed(ctx, t.ID); err != nil {
 			return err
 		}
-		return s.Session().RevokeAllSessionsForUser(ctx, t.UserID)
+		ids, err := s.Session().RevokeAllSessionsForUser(ctx, t.UserID)
+		if err != nil {
+			return err
+		}
+		revokedSessionIDs = ids
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return s.sessions.RevokeSessions(ctx, revokedSessionIDs)
 }
 
 // issueTokenPair generates a fresh token pair starting a new token family.

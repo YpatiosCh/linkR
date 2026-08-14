@@ -1,14 +1,24 @@
 package config
 
 import (
+	"linkMe/internal/redis"
 	"linkMe/pkg/dotenv"
 	"strings"
 )
 
 // Config holds every runtime configuration value the application needs.
 // All values are loaded from environment variables (or the .env file) by
-// Load. main validates that required fields are non-empty before handing
-// the Config off to the layers that need it.
+// Load. main validates that required fields are non-empty (and RedisClient
+// reachable) before handing the Config off to the layers that need it.
+//
+// RedisClient is a deliberate exception to "Config holds only primitive
+// values": session revocation (middleware), rate limiting (router), and two
+// services all need the same shared Redis client, and threading it through
+// every constructor individually was worse than holding it here once,
+// alongside the other shared config. pgxpool.Pool and the Resend client are
+// NOT given the same treatment — they only ever have one consumer each
+// (repository.NewRepoManager, service.NewServiceManager), so there's no
+// fan-out problem to solve for them.
 type Config struct {
 	DatabaseURL    string
 	JWTSecret      string
@@ -17,6 +27,7 @@ type Config struct {
 	ResendAPIKey   string
 	EmailFrom      string
 	FrontendURL    string
+	RedisClient    *redis.Client
 }
 
 // Load reads configuration from environment variables, falling back to the
@@ -39,5 +50,6 @@ func Load() Config {
 		ResendAPIKey:   dotenv.GetEnv("RESEND_API_KEY", ""),
 		EmailFrom:      dotenv.GetEnv("EMAIL_FROM", ""),
 		FrontendURL:    dotenv.GetEnv("FRONTEND_URL", "http://localhost:3000"),
+		RedisClient:    redis.NewClient(dotenv.GetEnv("REDIS_ADDR", "localhost:6380")),
 	}
 }

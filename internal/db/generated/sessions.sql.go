@@ -85,17 +85,32 @@ func (q *Queries) MarkSessionConsumed(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const revokeAllSessionsForUser = `-- name: RevokeAllSessionsForUser :exec
-UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL
+const revokeAllSessionsForUser = `-- name: RevokeAllSessionsForUser :many
+UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL RETURNING id
 `
 
-func (q *Queries) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, revokeAllSessionsForUser, userID)
-	return err
+func (q *Queries) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, revokeAllSessionsForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
-const revokeOtherSessionsForUser = `-- name: RevokeOtherSessionsForUser :exec
-UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id != $2 AND revoked_at IS NULL
+const revokeOtherSessionsForUser = `-- name: RevokeOtherSessionsForUser :many
+UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id != $2 AND revoked_at IS NULL RETURNING id
 `
 
 type RevokeOtherSessionsForUserParams struct {
@@ -103,9 +118,24 @@ type RevokeOtherSessionsForUserParams struct {
 	ID     uuid.UUID `json:"id"`
 }
 
-func (q *Queries) RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) error {
-	_, err := q.db.Exec(ctx, revokeOtherSessionsForUser, arg.UserID, arg.ID)
-	return err
+func (q *Queries) RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, revokeOtherSessionsForUser, arg.UserID, arg.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const revokeSession = `-- name: RevokeSession :exec
@@ -117,11 +147,26 @@ func (q *Queries) RevokeSession(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const revokeSessionFamily = `-- name: RevokeSessionFamily :exec
-UPDATE sessions SET revoked_at = now() WHERE token_family_id = $1 AND revoked_at IS NULL
+const revokeSessionFamily = `-- name: RevokeSessionFamily :many
+UPDATE sessions SET revoked_at = now() WHERE token_family_id = $1 AND revoked_at IS NULL RETURNING id
 `
 
-func (q *Queries) RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, revokeSessionFamily, tokenFamilyID)
-	return err
+func (q *Queries) RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, revokeSessionFamily, tokenFamilyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

@@ -49,11 +49,29 @@ func (f *fakeRepo) PasswordResetToken() repository.PasswordResetTokenRepository 
 	return f.passwordReset
 }
 
-// newTestAuthService builds an authService wired to repo, testCfg, and a
-// no-op fakeEmailService — the email-sending behavior itself is only
-// asserted by the tests that construct and inspect their own fakeEmailService.
+// newTestAuthService builds an authService wired to repo, testCfg, and
+// no-op fakeEmailService/fakeSessionRevoker — the email-sending and
+// session-revocation behavior are only asserted by the tests that
+// construct and inspect their own fakes.
 func newTestAuthService(repo *fakeRepo) service.AuthService {
-	return service.NewAuthService(repo, testCfg, &fakeEmailService{})
+	return service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{})
+}
+
+// fakeSessionRevoker is a spy service.SessionRevoker that captures the
+// session ID(s) passed to each call.
+type fakeSessionRevoker struct {
+	revokedSessionID  uuid.UUID
+	revokedSessionIDs []uuid.UUID
+	err               error
+}
+
+func (f *fakeSessionRevoker) RevokeSession(ctx context.Context, sessionID uuid.UUID) error {
+	f.revokedSessionID = sessionID
+	return f.err
+}
+func (f *fakeSessionRevoker) RevokeSessions(ctx context.Context, sessionIDs []uuid.UUID) error {
+	f.revokedSessionIDs = sessionIDs
+	return f.err
 }
 
 // defaultSub returns a minimal fakeSubscriptionRepo that always reports
@@ -117,6 +135,14 @@ type fakeSessionRepo struct {
 	revokedAllForUser   uuid.UUID
 	revokedOtherForUser uuid.UUID
 	keptSessionID       uuid.UUID
+
+	// revokedFamilyIDs/revokedAllIDs/revokedOtherIDs configure the session
+	// IDs the corresponding mass-revoke method reports as affected
+	// (:many RETURNING id in the real query) — tests that assert on
+	// SessionRevoker being called with the right IDs set these.
+	revokedFamilyIDs []uuid.UUID
+	revokedAllIDs    []uuid.UUID
+	revokedOtherIDs  []uuid.UUID
 }
 
 func (f *fakeSessionRepo) CreateSession(ctx context.Context, s models.Session) (models.Session, error) {
@@ -133,22 +159,22 @@ func (f *fakeSessionRepo) MarkSessionConsumed(ctx context.Context, id uuid.UUID)
 	f.consumedIDs = append(f.consumedIDs, id)
 	return nil
 }
-func (f *fakeSessionRepo) RevokeSessionFamily(ctx context.Context, familyID uuid.UUID) error {
+func (f *fakeSessionRepo) RevokeSessionFamily(ctx context.Context, familyID uuid.UUID) ([]uuid.UUID, error) {
 	f.revokedFamilies = append(f.revokedFamilies, familyID)
-	return nil
+	return f.revokedFamilyIDs, nil
 }
 func (f *fakeSessionRepo) RevokeSession(ctx context.Context, id uuid.UUID) error {
 	f.revokedSessions = append(f.revokedSessions, id)
 	return nil
 }
-func (f *fakeSessionRepo) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error {
+func (f *fakeSessionRepo) RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
 	f.revokedAllForUser = userID
-	return nil
+	return f.revokedAllIDs, nil
 }
-func (f *fakeSessionRepo) RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) error {
+func (f *fakeSessionRepo) RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) ([]uuid.UUID, error) {
 	f.revokedOtherForUser = userID
 	f.keptSessionID = keepSessionID
-	return nil
+	return f.revokedOtherIDs, nil
 }
 
 type fakeSubscriptionRepo struct {
@@ -425,13 +451,20 @@ func TestRefreshReuseDetected(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	_, _, err := newTestAuthService(repo).Refresh(context.Background(), "old-consumed-token")
+	revokedFamilyID := uuid.New()
+	sessions.revokedFamilyIDs = []uuid.UUID{revokedFamilyID}
+	revoker := &fakeSessionRevoker{}
+
+	_, _, err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).Refresh(context.Background(), "old-consumed-token")
 	if !errors.Is(err, msgs.ErrTokenReuseDetected) {
 		t.Fatalf("expected ErrTokenReuseDetected, got %v", err)
 	}
 	// The family must have been revoked defensively.
 	if len(sessions.revokedFamilies) != 1 || sessions.revokedFamilies[0] != familyID {
 		t.Errorf("expected family %s to be revoked on reuse detection, got %v", familyID, sessions.revokedFamilies)
+	}
+	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedFamilyID {
+		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedFamilyID}, revoker.revokedSessionIDs)
 	}
 }
 
@@ -529,29 +562,37 @@ func TestLogout(t *testing.T) {
 		session:  sessions,
 		sub:      defaultSub(),
 	}
+	revoker := &fakeSessionRevoker{}
 
-	err := newTestAuthService(repo).Logout(context.Background(), sessionID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).Logout(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
 	if len(sessions.revokedSessions) != 1 || sessions.revokedSessions[0] != sessionID {
 		t.Errorf("expected session %s to be revoked, got %v", sessionID, sessions.revokedSessions)
 	}
+	if revoker.revokedSessionID != sessionID {
+		t.Errorf("expected SessionRevoker to be called with %s, got %s", sessionID, revoker.revokedSessionID)
+	}
 }
 
 func TestLogoutAll(t *testing.T) {
 	userID := uuid.New()
-	sessions := &fakeSessionRepo{}
+	sessions := &fakeSessionRepo{revokedAllIDs: []uuid.UUID{uuid.New(), uuid.New()}}
 	repo := &fakeRepo{
 		user:     &fakeUserRepo{},
 		identity: &fakeIdentityRepo{},
 		session:  sessions,
 		sub:      defaultSub(),
 	}
+	revoker := &fakeSessionRevoker{}
 
-	err := newTestAuthService(repo).LogoutAll(context.Background(), userID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).LogoutAll(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
+	}
+	if len(revoker.revokedSessionIDs) != 2 {
+		t.Errorf("expected SessionRevoker to be called with %v, got %v", sessions.revokedAllIDs, revoker.revokedSessionIDs)
 	}
 	if sessions.revokedAllForUser != userID {
 		t.Errorf("expected all sessions for user %s to be revoked, got %v", userID, sessions.revokedAllForUser)
@@ -612,7 +653,7 @@ func TestRequestEmailVerification_Success(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
 	if err := svc.RequestEmailVerification(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -638,7 +679,7 @@ func TestRequestEmailVerification_UnknownEmail(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
 	if err := svc.RequestEmailVerification(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -664,7 +705,7 @@ func TestRequestEmailVerification_AlreadyVerified(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
 	if err := svc.RequestEmailVerification(context.Background(), "ada@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -800,7 +841,7 @@ func TestRequestPasswordReset_Success(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
 	if err := svc.RequestPasswordReset(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -826,7 +867,7 @@ func TestRequestPasswordReset_UnknownEmail(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
 	if err := svc.RequestPasswordReset(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -858,7 +899,8 @@ func TestResetPassword_Success(t *testing.T) {
 			return identity, nil
 		},
 	}
-	sessions := &fakeSessionRepo{}
+	revokedSessionID := uuid.New()
+	sessions := &fakeSessionRepo{revokedAllIDs: []uuid.UUID{revokedSessionID}}
 	repo := &fakeRepo{
 		user:          &fakeUserRepo{},
 		identity:      identities,
@@ -866,8 +908,9 @@ func TestResetPassword_Success(t *testing.T) {
 		sub:           defaultSub(),
 		passwordReset: tokens,
 	}
+	revoker := &fakeSessionRevoker{}
 
-	err := newTestAuthService(repo).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -879,6 +922,9 @@ func TestResetPassword_Success(t *testing.T) {
 	}
 	if sessions.revokedAllForUser != userID {
 		t.Errorf("expected all sessions for user %s to be revoked, got %v", userID, sessions.revokedAllForUser)
+	}
+	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedSessionID {
+		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedSessionID}, revoker.revokedSessionIDs)
 	}
 }
 

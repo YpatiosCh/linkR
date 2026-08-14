@@ -89,18 +89,24 @@ type SessionRepository interface {
 	// recording that it has been rotated and must not be used again.
 	MarkSessionConsumed(ctx context.Context, id uuid.UUID) error
 	// RevokeSessionFamily sets revoked_at on every non-revoked session in
-	// the given token family, used when reuse of a consumed token is detected.
-	RevokeSessionFamily(ctx context.Context, familyID uuid.UUID) error
+	// the given token family, used when reuse of a consumed token is
+	// detected. Returns the IDs of the sessions that were revoked, so the
+	// caller can also invalidate them in the shared session-revocation store.
+	RevokeSessionFamily(ctx context.Context, familyID uuid.UUID) ([]uuid.UUID, error)
 	// RevokeSession sets revoked_at on the session with the given ID,
 	// invalidating it. Idempotent — safe to call on an already-revoked session.
 	RevokeSession(ctx context.Context, id uuid.UUID) error
 	// RevokeAllSessionsForUser sets revoked_at on every non-revoked session
-	// belonging to the given user, used during logout-all.
-	RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error
+	// belonging to the given user, used during logout-all. Returns the IDs
+	// of the sessions that were revoked, so the caller can also invalidate
+	// them in the shared session-revocation store.
+	RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
 	// RevokeOtherSessionsForUser sets revoked_at on every non-revoked session
 	// belonging to the given user except the session with keepSessionID, used
-	// during password change to keep the current session alive.
-	RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) error
+	// during password change to keep the current session alive. Returns the
+	// IDs of the sessions that were revoked, so the caller can also
+	// invalidate them in the shared session-revocation store.
+	RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) ([]uuid.UUID, error)
 }
 
 // EmailVerificationTokenRepository defines the data-access operations for

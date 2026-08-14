@@ -26,7 +26,7 @@ func TestGetMeSuccess(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	user, sub, err := service.NewUserService(repo).GetMe(context.Background(), userID)
+	user, sub, err := service.NewUserService(repo, &fakeSessionRevoker{}).GetMe(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestGetMeUserNotFound(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	_, _, err := service.NewUserService(repo).GetMe(context.Background(), uuid.New())
+	_, _, err := service.NewUserService(repo, &fakeSessionRevoker{}).GetMe(context.Background(), uuid.New())
 	if !errors.Is(err, msgs.ErrUserNotFound) {
 		t.Fatalf("expected ErrUserNotFound, got %v", err)
 	}
@@ -58,7 +58,8 @@ func TestChangePasswordSuccess(t *testing.T) {
 	userID := uuid.New()
 	sessionID := uuid.New()
 	identity := passwordIdentity(t, userID, "old-correct-battery")
-	sessions := &fakeSessionRepo{}
+	revokedSessionID := uuid.New()
+	sessions := &fakeSessionRepo{revokedOtherIDs: []uuid.UUID{revokedSessionID}}
 	identities := &fakeIdentityRepo{
 		getByUserAndProv: func(_ context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
 			return identity, nil
@@ -71,8 +72,9 @@ func TestChangePasswordSuccess(t *testing.T) {
 		session:  sessions,
 		sub:      defaultSub(),
 	}
+	revoker := &fakeSessionRevoker{}
 
-	err := service.NewUserService(repo).ChangePassword(
+	err := service.NewUserService(repo, revoker).ChangePassword(
 		context.Background(), userID, sessionID, "old-correct-battery", "new-correct-battery",
 	)
 	if err != nil {
@@ -86,6 +88,9 @@ func TestChangePasswordSuccess(t *testing.T) {
 	}
 	if sessions.keptSessionID != sessionID {
 		t.Errorf("expected current session %s to be kept, got %v", sessionID, sessions.keptSessionID)
+	}
+	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedSessionID {
+		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedSessionID}, revoker.revokedSessionIDs)
 	}
 }
 
@@ -104,7 +109,7 @@ func TestChangePasswordInvalidCredentials(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	err := service.NewUserService(repo).ChangePassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}).ChangePassword(
 		context.Background(), userID, uuid.New(), "wrong-password", "new-correct-battery",
 	)
 	if !errors.Is(err, msgs.ErrInvalidCredentials) {
@@ -122,7 +127,7 @@ func TestChangePasswordOAuthOnlyAccount(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	err := service.NewUserService(repo).ChangePassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}).ChangePassword(
 		context.Background(), userID, uuid.New(), "any", "new-correct-battery",
 	)
 	if !errors.Is(err, msgs.ErrPasswordNotSet) {
@@ -144,7 +149,7 @@ func TestChangePasswordWeakNewPassword(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	err := service.NewUserService(repo).ChangePassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}).ChangePassword(
 		context.Background(), userID, uuid.New(), "correct-battery", "weak",
 	)
 	if !errors.Is(err, msgs.ErrInvalidCredentials) {

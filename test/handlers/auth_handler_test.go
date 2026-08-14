@@ -436,8 +436,16 @@ func TestRefreshHandler_ReuseDetected(t *testing.T) {
 // secret, so authenticated handler tests exercise the full middleware + handler chain.
 const handlerTestSecret = "handler-test-secret-at-least-32-bytes!!"
 
+// notRevokedChecker is a fake middleware.SessionRevocationChecker that
+// always reports every session as not revoked.
+type notRevokedChecker struct{}
+
+func (notRevokedChecker) IsSessionRevoked(ctx context.Context, sessionID uuid.UUID) (bool, error) {
+	return false, nil
+}
+
 func handlerWithAuth(h http.Handler) http.Handler {
-	return middleware.RequireAuth(handlerTestSecret)(h)
+	return middleware.RequireAuth(handlerTestSecret, notRevokedChecker{})(h)
 }
 
 // --- Logout ---
