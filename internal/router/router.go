@@ -34,9 +34,16 @@ func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 	mux.Handle("POST /api/v1/auth/logout", rl(10, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Auth().Logout))))
 	mux.Handle("POST /api/v1/auth/logout-all", rl(5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Auth().LogoutAll))))
 
+	// Public email verification and password reset routes — the opaque
+	// token in the request body is the credential, not a bearer token.
+	mux.Handle("POST /api/v1/auth/email/verification/request", rl(5, time.Hour)(http.HandlerFunc(h.Auth().RequestEmailVerification)))
+	mux.Handle("POST /api/v1/auth/email/verification/verify", rl(10, 15*time.Minute)(http.HandlerFunc(h.Auth().VerifyEmail)))
+	mux.Handle("POST /api/v1/auth/password/reset/request", rl(5, time.Hour)(http.HandlerFunc(h.Auth().RequestPasswordReset)))
+	mux.Handle("POST /api/v1/auth/password/reset/confirm", rl(10, 15*time.Minute)(http.HandlerFunc(h.Auth().ResetPassword)))
+
 	// Authenticated current-user routes.
-	mux.Handle("GET /api/v1/me", rl(60, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Me().GetMe))))
-	mux.Handle("POST /api/v1/me/password/change", rl(5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Me().ChangePassword))))
+	mux.Handle("GET /api/v1/me", rl(60, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().GetMe))))
+	mux.Handle("POST /api/v1/me/password/change", rl(5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().ChangePassword))))
 
 	// Global middleware: security headers run first (outermost), then CORS.
 	return middleware.SecurityHeaders(cfg.AppEnv)(

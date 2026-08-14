@@ -14,3 +14,6 @@ SELECT *
 FROM users
 WHERE id = $1
   AND deleted_at IS NULL;
+
+-- name: UpdateEmailVerifiedAt :exec
+UPDATE users SET email_verified_at = now() WHERE id = $1;

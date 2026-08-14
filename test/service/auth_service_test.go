@@ -27,10 +27,12 @@ var testCfg = config.Config{JWTSecret: "test-secret-at-least-32-bytes-long!!"}
 // the rest satisfy the interface with safe no-op defaults.
 
 type fakeRepo struct {
-	user     *fakeUserRepo
-	identity *fakeIdentityRepo
-	session  *fakeSessionRepo
-	sub      *fakeSubscriptionRepo
+	user              *fakeUserRepo
+	identity          *fakeIdentityRepo
+	session           *fakeSessionRepo
+	sub               *fakeSubscriptionRepo
+	emailVerification *fakeEmailVerificationTokenRepo
+	passwordReset     *fakePasswordResetTokenRepo
 }
 
 func (f *fakeRepo) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
@@ -40,6 +42,19 @@ func (f *fakeRepo) User() repository.UserRepository                 { return f.u
 func (f *fakeRepo) AuthIdentity() repository.AuthIdentityRepository { return f.identity }
 func (f *fakeRepo) Subscription() repository.SubscriptionRepository { return f.sub }
 func (f *fakeRepo) Session() repository.SessionRepository           { return f.session }
+func (f *fakeRepo) EmailVerificationToken() repository.EmailVerificationTokenRepository {
+	return f.emailVerification
+}
+func (f *fakeRepo) PasswordResetToken() repository.PasswordResetTokenRepository {
+	return f.passwordReset
+}
+
+// newTestAuthService builds an authService wired to repo, testCfg, and a
+// no-op fakeEmailService — the email-sending behavior itself is only
+// asserted by the tests that construct and inspect their own fakeEmailService.
+func newTestAuthService(repo *fakeRepo) service.AuthService {
+	return service.NewAuthService(repo, testCfg, &fakeEmailService{})
+}
 
 // defaultSub returns a minimal fakeSubscriptionRepo that always reports
 // the free plan — suitable for tests that don't care about the plan.
@@ -48,8 +63,9 @@ func defaultSub() *fakeSubscriptionRepo {
 }
 
 type fakeUserRepo struct {
-	getByID    func(ctx context.Context, id uuid.UUID) (models.User, error)
-	getByEmail func(ctx context.Context, email string) (models.User, error)
+	getByID              func(ctx context.Context, id uuid.UUID) (models.User, error)
+	getByEmail           func(ctx context.Context, email string) (models.User, error)
+	verifiedEmailUserIDs []uuid.UUID
 }
 
 func (f *fakeUserRepo) CreateUser(ctx context.Context, u models.User) (models.User, error) {
@@ -63,6 +79,10 @@ func (f *fakeUserRepo) GetUserByEmail(ctx context.Context, email string) (models
 }
 func (f *fakeUserRepo) GetUserByID(ctx context.Context, id uuid.UUID) (models.User, error) {
 	return f.getByID(ctx, id)
+}
+func (f *fakeUserRepo) UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error {
+	f.verifiedEmailUserIDs = append(f.verifiedEmailUserIDs, id)
+	return nil
 }
 
 type fakeIdentityRepo struct {
@@ -142,6 +162,71 @@ func (f *fakeSubscriptionRepo) GetActiveSubscriptionByUserID(ctx context.Context
 	return models.Subscription{PlanID: f.planID}, nil
 }
 
+type fakeEmailVerificationTokenRepo struct {
+	getByHash   func(ctx context.Context, hash string) (models.EmailVerificationToken, error)
+	created     int
+	consumedIDs []uuid.UUID
+}
+
+func (f *fakeEmailVerificationTokenRepo) CreateEmailVerificationToken(ctx context.Context, t models.EmailVerificationToken) (models.EmailVerificationToken, error) {
+	f.created++
+	return t, nil
+}
+func (f *fakeEmailVerificationTokenRepo) GetEmailVerificationTokenByHash(ctx context.Context, hash string) (models.EmailVerificationToken, error) {
+	if f.getByHash != nil {
+		return f.getByHash(ctx, hash)
+	}
+	return models.EmailVerificationToken{}, msgs.ErrTokenInvalid
+}
+func (f *fakeEmailVerificationTokenRepo) MarkEmailVerificationTokenConsumed(ctx context.Context, id uuid.UUID) error {
+	f.consumedIDs = append(f.consumedIDs, id)
+	return nil
+}
+
+type fakePasswordResetTokenRepo struct {
+	getByHash   func(ctx context.Context, hash string) (models.PasswordResetToken, error)
+	created     int
+	consumedIDs []uuid.UUID
+}
+
+func (f *fakePasswordResetTokenRepo) CreatePasswordResetToken(ctx context.Context, t models.PasswordResetToken) (models.PasswordResetToken, error) {
+	f.created++
+	return t, nil
+}
+func (f *fakePasswordResetTokenRepo) GetPasswordResetTokenByHash(ctx context.Context, hash string) (models.PasswordResetToken, error) {
+	if f.getByHash != nil {
+		return f.getByHash(ctx, hash)
+	}
+	return models.PasswordResetToken{}, msgs.ErrTokenInvalid
+}
+func (f *fakePasswordResetTokenRepo) MarkPasswordResetTokenConsumed(ctx context.Context, id uuid.UUID) error {
+	f.consumedIDs = append(f.consumedIDs, id)
+	return nil
+}
+
+// fakeEmailService is a spy service.EmailService that captures the
+// email/token pair passed to each Send call, for tests asserting an email
+// was actually "sent".
+type fakeEmailService struct {
+	verificationEmail   string
+	verificationToken   string
+	passwordResetEmail  string
+	passwordResetToken  string
+	sendVerificationErr error
+	sendResetErr        error
+}
+
+func (f *fakeEmailService) SendVerificationEmail(ctx context.Context, email string, token string) error {
+	f.verificationEmail = email
+	f.verificationToken = token
+	return f.sendVerificationErr
+}
+func (f *fakeEmailService) SendPasswordResetEmail(ctx context.Context, email string, token string) error {
+	f.passwordResetEmail = email
+	f.passwordResetToken = token
+	return f.sendResetErr
+}
+
 // passwordIdentity builds a password auth identity whose stored hash matches
 // the given plaintext password, for a user with the given id.
 func passwordIdentity(t *testing.T, userID uuid.UUID, password string) models.AuthIdentity {
@@ -188,7 +273,7 @@ func TestLoginSuccess(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	svc := service.NewAuthService(repo, testCfg)
+	svc := newTestAuthService(repo)
 
 	// Mixed-case/padded email must be normalized before lookup.
 	user, pair, err := svc.Login(context.Background(), models.LoginInput{
@@ -264,7 +349,7 @@ func TestLoginInvalidCredentials(t *testing.T) {
 				sub:     defaultSub(),
 			}
 
-			_, _, err := service.NewAuthService(repo, testCfg).Login(context.Background(), tc.input)
+			_, _, err := newTestAuthService(repo).Login(context.Background(), tc.input)
 			if !errors.Is(err, msgs.ErrInvalidCredentials) {
 				t.Fatalf("expected ErrInvalidCredentials, got %v", err)
 			}
@@ -301,7 +386,7 @@ func TestRefreshSuccess(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	svc := service.NewAuthService(repo, testCfg)
+	svc := newTestAuthService(repo)
 	_, pair, err := svc.Refresh(context.Background(), "some-raw-refresh-token")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
@@ -340,7 +425,7 @@ func TestRefreshReuseDetected(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	_, _, err := service.NewAuthService(repo, testCfg).Refresh(context.Background(), "old-consumed-token")
+	_, _, err := newTestAuthService(repo).Refresh(context.Background(), "old-consumed-token")
 	if !errors.Is(err, msgs.ErrTokenReuseDetected) {
 		t.Fatalf("expected ErrTokenReuseDetected, got %v", err)
 	}
@@ -367,7 +452,7 @@ func TestRefreshExpiredSession(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	_, _, err := service.NewAuthService(repo, testCfg).Refresh(context.Background(), "expired-token")
+	_, _, err := newTestAuthService(repo).Refresh(context.Background(), "expired-token")
 	if !errors.Is(err, msgs.ErrTokenInvalid) {
 		t.Fatalf("expected ErrTokenInvalid for an expired session, got %v", err)
 	}
@@ -377,7 +462,7 @@ func TestRegisterSuccess(t *testing.T) {
 	sessions := &fakeSessionRepo{}
 	repo := &fakeRepo{
 		// getByEmail defaults to ErrUserNotFound — email is free
-		user:     &fakeUserRepo{},
+		user: &fakeUserRepo{},
 		identity: &fakeIdentityRepo{get: func(ctx context.Context, p, s string) (models.AuthIdentity, error) {
 			return models.AuthIdentity{}, msgs.ErrUserNotFound
 		}},
@@ -385,7 +470,7 @@ func TestRegisterSuccess(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	user, pair, err := service.NewAuthService(repo, testCfg).Register(context.Background(), models.RegisterInput{
+	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
 		Email:    "  New@Example.com ",
 		Password: "correct-horse-battery",
 		Name:     "Ada",
@@ -425,7 +510,7 @@ func TestRegisterEmailAlreadyExists(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	_, _, err := service.NewAuthService(repo, testCfg).Register(context.Background(), models.RegisterInput{
+	_, _, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
 		Email:    "taken@example.com",
 		Password: "correct-horse-battery",
 		Name:     "New User",
@@ -445,7 +530,7 @@ func TestLogout(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	err := service.NewAuthService(repo, testCfg).Logout(context.Background(), sessionID)
+	err := newTestAuthService(repo).Logout(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -464,149 +549,12 @@ func TestLogoutAll(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	err := service.NewAuthService(repo, testCfg).LogoutAll(context.Background(), userID)
+	err := newTestAuthService(repo).LogoutAll(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
 	if sessions.revokedAllForUser != userID {
 		t.Errorf("expected all sessions for user %s to be revoked, got %v", userID, sessions.revokedAllForUser)
-	}
-}
-
-func TestGetMeSuccess(t *testing.T) {
-	userID := uuid.New()
-	repo := &fakeRepo{
-		user: &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
-			return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
-		}},
-		identity: &fakeIdentityRepo{},
-		session:  &fakeSessionRepo{},
-		sub:      defaultSub(),
-	}
-
-	user, sub, err := service.NewAuthService(repo, testCfg).GetMe(context.Background(), userID)
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
-	}
-	if user.ID != userID {
-		t.Errorf("user.ID: got %s, want %s", user.ID, userID)
-	}
-	if sub.PlanID != models.FreePlan.String() {
-		t.Errorf("sub.PlanID: got %q, want %q", sub.PlanID, models.FreePlan.String())
-	}
-}
-
-func TestGetMeUserNotFound(t *testing.T) {
-	repo := &fakeRepo{
-		user: &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
-			return models.User{}, msgs.ErrUserNotFound
-		}},
-		identity: &fakeIdentityRepo{},
-		session:  &fakeSessionRepo{},
-		sub:      defaultSub(),
-	}
-
-	_, _, err := service.NewAuthService(repo, testCfg).GetMe(context.Background(), uuid.New())
-	if !errors.Is(err, msgs.ErrUserNotFound) {
-		t.Fatalf("expected ErrUserNotFound, got %v", err)
-	}
-}
-
-func TestChangePasswordSuccess(t *testing.T) {
-	userID := uuid.New()
-	sessionID := uuid.New()
-	identity := passwordIdentity(t, userID, "old-correct-battery")
-	sessions := &fakeSessionRepo{}
-	identities := &fakeIdentityRepo{
-		getByUserAndProv: func(_ context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
-			return identity, nil
-		},
-	}
-
-	repo := &fakeRepo{
-		user:     &fakeUserRepo{},
-		identity: identities,
-		session:  sessions,
-		sub:      defaultSub(),
-	}
-
-	err := service.NewAuthService(repo, testCfg).ChangePassword(
-		context.Background(), userID, sessionID, "old-correct-battery", "new-correct-battery",
-	)
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
-	}
-	if identities.updatedHash == "" {
-		t.Error("expected password hash to be updated")
-	}
-	if sessions.revokedOtherForUser != userID {
-		t.Errorf("expected other sessions for user %s to be revoked, got %v", userID, sessions.revokedOtherForUser)
-	}
-	if sessions.keptSessionID != sessionID {
-		t.Errorf("expected current session %s to be kept, got %v", sessionID, sessions.keptSessionID)
-	}
-}
-
-func TestChangePasswordInvalidCredentials(t *testing.T) {
-	userID := uuid.New()
-	identity := passwordIdentity(t, userID, "correct-battery")
-
-	repo := &fakeRepo{
-		user: &fakeUserRepo{},
-		identity: &fakeIdentityRepo{
-			getByUserAndProv: func(_ context.Context, _ uuid.UUID, _ string) (models.AuthIdentity, error) {
-				return identity, nil
-			},
-		},
-		session: &fakeSessionRepo{},
-		sub:     defaultSub(),
-	}
-
-	err := service.NewAuthService(repo, testCfg).ChangePassword(
-		context.Background(), userID, uuid.New(), "wrong-password", "new-correct-battery",
-	)
-	if !errors.Is(err, msgs.ErrInvalidCredentials) {
-		t.Fatalf("expected ErrInvalidCredentials for wrong current password, got %v", err)
-	}
-}
-
-func TestChangePasswordOAuthOnlyAccount(t *testing.T) {
-	userID := uuid.New()
-	repo := &fakeRepo{
-		user: &fakeUserRepo{},
-		// getByUserAndProv not set → defaults to ErrUserNotFound → OAuth-only
-		identity: &fakeIdentityRepo{},
-		session:  &fakeSessionRepo{},
-		sub:      defaultSub(),
-	}
-
-	err := service.NewAuthService(repo, testCfg).ChangePassword(
-		context.Background(), userID, uuid.New(), "any", "new-correct-battery",
-	)
-	if !errors.Is(err, msgs.ErrPasswordNotSet) {
-		t.Fatalf("expected ErrPasswordNotSet for OAuth-only account, got %v", err)
-	}
-}
-
-func TestChangePasswordWeakNewPassword(t *testing.T) {
-	userID := uuid.New()
-	identity := passwordIdentity(t, userID, "correct-battery")
-	repo := &fakeRepo{
-		user: &fakeUserRepo{},
-		identity: &fakeIdentityRepo{
-			getByUserAndProv: func(_ context.Context, _ uuid.UUID, _ string) (models.AuthIdentity, error) {
-				return identity, nil
-			},
-		},
-		session: &fakeSessionRepo{},
-		sub:     defaultSub(),
-	}
-
-	err := service.NewAuthService(repo, testCfg).ChangePassword(
-		context.Background(), userID, uuid.New(), "correct-battery", "weak",
-	)
-	if !errors.Is(err, msgs.ErrInvalidCredentials) {
-		t.Fatalf("expected ErrInvalidCredentials for weak new password, got %v", err)
 	}
 }
 
@@ -637,7 +585,7 @@ func TestRegisterInvalidInput(t *testing.T) {
 				sub:      defaultSub(),
 			}
 
-			_, _, err := service.NewAuthService(repo, testCfg).Register(context.Background(), tc.input)
+			_, _, err := newTestAuthService(repo).Register(context.Background(), tc.input)
 			if !errors.Is(err, msgs.ErrInvalidCredentials) {
 				t.Fatalf("expected ErrInvalidCredentials for %q, got %v", tc.name, err)
 			}
@@ -645,5 +593,372 @@ func TestRegisterInvalidInput(t *testing.T) {
 				t.Errorf("no session should be created on failed registration, got %d", sessions.created)
 			}
 		})
+	}
+}
+
+// --- RequestEmailVerification ---
+
+func TestRequestEmailVerification_Success(t *testing.T) {
+	userID := uuid.New()
+	tokens := &fakeEmailVerificationTokenRepo{}
+	emailSvc := &fakeEmailService{}
+	repo := &fakeRepo{
+		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+		}},
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: tokens,
+	}
+
+	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	if err := svc.RequestEmailVerification(context.Background(), "  Ada@Example.com "); err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if tokens.created != 1 {
+		t.Errorf("expected exactly one token to be created, got %d", tokens.created)
+	}
+	if emailSvc.verificationEmail != "ada@example.com" {
+		t.Errorf("expected verification email to normalized address, got %q", emailSvc.verificationEmail)
+	}
+	if emailSvc.verificationToken == "" {
+		t.Error("expected a non-empty raw token to be sent")
+	}
+}
+
+func TestRequestEmailVerification_UnknownEmail(t *testing.T) {
+	tokens := &fakeEmailVerificationTokenRepo{}
+	emailSvc := &fakeEmailService{}
+	repo := &fakeRepo{
+		user:              &fakeUserRepo{},
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: tokens,
+	}
+
+	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	if err := svc.RequestEmailVerification(context.Background(), "unknown@example.com"); err != nil {
+		t.Fatalf("expected silent success, got error: %v", err)
+	}
+	if tokens.created != 0 {
+		t.Errorf("no token should be created for an unknown email, got %d", tokens.created)
+	}
+	if emailSvc.verificationEmail != "" {
+		t.Error("no email should be sent for an unknown email")
+	}
+}
+
+func TestRequestEmailVerification_AlreadyVerified(t *testing.T) {
+	verifiedAt := time.Now().Add(-time.Hour)
+	tokens := &fakeEmailVerificationTokenRepo{}
+	emailSvc := &fakeEmailService{}
+	repo := &fakeRepo{
+		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return models.User{ID: uuid.New(), Email: email, EmailVerifiedAt: &verifiedAt}, nil
+		}},
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: tokens,
+	}
+
+	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	if err := svc.RequestEmailVerification(context.Background(), "ada@example.com"); err != nil {
+		t.Fatalf("expected silent success, got error: %v", err)
+	}
+	if tokens.created != 0 {
+		t.Errorf("no token should be created for an already-verified email, got %d", tokens.created)
+	}
+	if emailSvc.verificationEmail != "" {
+		t.Error("no email should be sent for an already-verified email")
+	}
+}
+
+// --- VerifyEmail ---
+
+func TestVerifyEmail_Success(t *testing.T) {
+	userID := uuid.New()
+	tokenID := uuid.New()
+	tokens := &fakeEmailVerificationTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.EmailVerificationToken, error) {
+			return models.EmailVerificationToken{
+				ID:        tokenID,
+				UserID:    userID,
+				ExpiresAt: time.Now().Add(time.Hour),
+			}, nil
+		},
+	}
+	users := &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+		return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+	}}
+	repo := &fakeRepo{
+		user:              users,
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: tokens,
+	}
+
+	user, sub, err := newTestAuthService(repo).VerifyEmail(context.Background(), "some-raw-token")
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if user.ID != userID {
+		t.Errorf("user.ID: got %s, want %s", user.ID, userID)
+	}
+	if sub.PlanID != models.FreePlan.String() {
+		t.Errorf("sub.PlanID: got %q, want %q", sub.PlanID, models.FreePlan.String())
+	}
+	if len(users.verifiedEmailUserIDs) != 1 || users.verifiedEmailUserIDs[0] != userID {
+		t.Errorf("expected user %s to be marked verified, got %v", userID, users.verifiedEmailUserIDs)
+	}
+	if len(tokens.consumedIDs) != 1 || tokens.consumedIDs[0] != tokenID {
+		t.Errorf("expected token %s to be consumed, got %v", tokenID, tokens.consumedIDs)
+	}
+}
+
+func TestVerifyEmail_NotFound(t *testing.T) {
+	repo := &fakeRepo{
+		user:              &fakeUserRepo{},
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: &fakeEmailVerificationTokenRepo{},
+	}
+
+	_, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "unknown-token")
+	if !errors.Is(err, msgs.ErrTokenInvalid) {
+		t.Fatalf("expected ErrTokenInvalid, got %v", err)
+	}
+}
+
+func TestVerifyEmail_Expired(t *testing.T) {
+	tokens := &fakeEmailVerificationTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.EmailVerificationToken, error) {
+			return models.EmailVerificationToken{
+				ID:        uuid.New(),
+				UserID:    uuid.New(),
+				ExpiresAt: time.Now().Add(-time.Minute),
+			}, nil
+		},
+	}
+	repo := &fakeRepo{
+		user:              &fakeUserRepo{},
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: tokens,
+	}
+
+	_, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "expired-token")
+	if !errors.Is(err, msgs.ErrTokenInvalid) {
+		t.Fatalf("expected ErrTokenInvalid for an expired token, got %v", err)
+	}
+}
+
+func TestVerifyEmail_AlreadyUsed(t *testing.T) {
+	usedAt := time.Now().Add(-time.Minute)
+	tokens := &fakeEmailVerificationTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.EmailVerificationToken, error) {
+			return models.EmailVerificationToken{
+				ID:        uuid.New(),
+				UserID:    uuid.New(),
+				ExpiresAt: time.Now().Add(time.Hour),
+				UsedAt:    &usedAt,
+			}, nil
+		},
+	}
+	repo := &fakeRepo{
+		user:              &fakeUserRepo{},
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: tokens,
+	}
+
+	_, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "consumed-token")
+	if !errors.Is(err, msgs.ErrTokenAlreadyUsed) {
+		t.Fatalf("expected ErrTokenAlreadyUsed, got %v", err)
+	}
+}
+
+// --- RequestPasswordReset ---
+
+func TestRequestPasswordReset_Success(t *testing.T) {
+	userID := uuid.New()
+	tokens := &fakePasswordResetTokenRepo{}
+	emailSvc := &fakeEmailService{}
+	repo := &fakeRepo{
+		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+		}},
+		identity:      &fakeIdentityRepo{},
+		session:       &fakeSessionRepo{},
+		sub:           defaultSub(),
+		passwordReset: tokens,
+	}
+
+	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	if err := svc.RequestPasswordReset(context.Background(), "  Ada@Example.com "); err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if tokens.created != 1 {
+		t.Errorf("expected exactly one token to be created, got %d", tokens.created)
+	}
+	if emailSvc.passwordResetEmail != "ada@example.com" {
+		t.Errorf("expected password reset email to normalized address, got %q", emailSvc.passwordResetEmail)
+	}
+	if emailSvc.passwordResetToken == "" {
+		t.Error("expected a non-empty raw token to be sent")
+	}
+}
+
+func TestRequestPasswordReset_UnknownEmail(t *testing.T) {
+	tokens := &fakePasswordResetTokenRepo{}
+	emailSvc := &fakeEmailService{}
+	repo := &fakeRepo{
+		user:          &fakeUserRepo{},
+		identity:      &fakeIdentityRepo{},
+		session:       &fakeSessionRepo{},
+		sub:           defaultSub(),
+		passwordReset: tokens,
+	}
+
+	svc := service.NewAuthService(repo, testCfg, emailSvc)
+	if err := svc.RequestPasswordReset(context.Background(), "unknown@example.com"); err != nil {
+		t.Fatalf("expected silent success, got error: %v", err)
+	}
+	if tokens.created != 0 {
+		t.Errorf("no token should be created for an unknown email, got %d", tokens.created)
+	}
+	if emailSvc.passwordResetEmail != "" {
+		t.Error("no email should be sent for an unknown email")
+	}
+}
+
+// --- ResetPassword ---
+
+func TestResetPassword_Success(t *testing.T) {
+	userID := uuid.New()
+	tokenID := uuid.New()
+	identity := passwordIdentity(t, userID, "old-correct-battery")
+	tokens := &fakePasswordResetTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.PasswordResetToken, error) {
+			return models.PasswordResetToken{
+				ID:        tokenID,
+				UserID:    userID,
+				ExpiresAt: time.Now().Add(time.Hour),
+			}, nil
+		},
+	}
+	identities := &fakeIdentityRepo{
+		getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
+			return identity, nil
+		},
+	}
+	sessions := &fakeSessionRepo{}
+	repo := &fakeRepo{
+		user:          &fakeUserRepo{},
+		identity:      identities,
+		session:       sessions,
+		sub:           defaultSub(),
+		passwordReset: tokens,
+	}
+
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if identities.updatedHash == "" {
+		t.Error("expected password hash to be updated")
+	}
+	if len(tokens.consumedIDs) != 1 || tokens.consumedIDs[0] != tokenID {
+		t.Errorf("expected token %s to be consumed, got %v", tokenID, tokens.consumedIDs)
+	}
+	if sessions.revokedAllForUser != userID {
+		t.Errorf("expected all sessions for user %s to be revoked, got %v", userID, sessions.revokedAllForUser)
+	}
+}
+
+func TestResetPassword_TokenInvalid(t *testing.T) {
+	repo := &fakeRepo{
+		user:          &fakeUserRepo{},
+		identity:      &fakeIdentityRepo{},
+		session:       &fakeSessionRepo{},
+		sub:           defaultSub(),
+		passwordReset: &fakePasswordResetTokenRepo{},
+	}
+
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "unknown-token", "new-correct-battery")
+	if !errors.Is(err, msgs.ErrTokenInvalid) {
+		t.Fatalf("expected ErrTokenInvalid, got %v", err)
+	}
+}
+
+func TestResetPassword_TokenAlreadyUsed(t *testing.T) {
+	usedAt := time.Now().Add(-time.Minute)
+	tokens := &fakePasswordResetTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.PasswordResetToken, error) {
+			return models.PasswordResetToken{
+				ID:        uuid.New(),
+				UserID:    uuid.New(),
+				ExpiresAt: time.Now().Add(time.Hour),
+				UsedAt:    &usedAt,
+			}, nil
+		},
+	}
+	repo := &fakeRepo{
+		user:          &fakeUserRepo{},
+		identity:      &fakeIdentityRepo{},
+		session:       &fakeSessionRepo{},
+		sub:           defaultSub(),
+		passwordReset: tokens,
+	}
+
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "consumed-token", "new-correct-battery")
+	if !errors.Is(err, msgs.ErrTokenAlreadyUsed) {
+		t.Fatalf("expected ErrTokenAlreadyUsed, got %v", err)
+	}
+}
+
+func TestResetPassword_OAuthOnlyAccount(t *testing.T) {
+	tokens := &fakePasswordResetTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.PasswordResetToken, error) {
+			return models.PasswordResetToken{
+				ID:        uuid.New(),
+				UserID:    uuid.New(),
+				ExpiresAt: time.Now().Add(time.Hour),
+			}, nil
+		},
+	}
+	repo := &fakeRepo{
+		user: &fakeUserRepo{},
+		// getByUserAndProv not set → defaults to ErrUserNotFound → OAuth-only
+		identity:      &fakeIdentityRepo{},
+		session:       &fakeSessionRepo{},
+		sub:           defaultSub(),
+		passwordReset: tokens,
+	}
+
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
+	if !errors.Is(err, msgs.ErrPasswordNotSet) {
+		t.Fatalf("expected ErrPasswordNotSet for OAuth-only account, got %v", err)
+	}
+}
+
+func TestResetPassword_WeakPassword(t *testing.T) {
+	repo := &fakeRepo{
+		user:          &fakeUserRepo{},
+		identity:      &fakeIdentityRepo{},
+		session:       &fakeSessionRepo{},
+		sub:           defaultSub(),
+		passwordReset: &fakePasswordResetTokenRepo{},
+	}
+
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "some-raw-token", "weak")
+	if !errors.Is(err, msgs.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials for a weak new password, got %v", err)
 	}
 }

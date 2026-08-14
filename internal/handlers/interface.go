@@ -8,8 +8,8 @@ type Handler interface {
 	// Auth returns the AuthHandler, which handles all authentication
 	// related HTTP endpoints such as registration.
 	Auth() AuthHandler
-	// Me returns the MeHandler, which handles authenticated current-user endpoints.
-	Me() MeHandler
+	// User returns the UserHandler, which handles authenticated current-user endpoints.
+	User() UserHandler
 }
 
 // AuthHandler defines the HTTP endpoints for user authentication.
@@ -31,10 +31,26 @@ type AuthHandler interface {
 	// LogoutAll handles POST /api/v1/auth/logout-all: revokes all sessions for
 	// the authenticated user and clears authentication cookies.
 	LogoutAll(w http.ResponseWriter, r *http.Request)
+	// RequestEmailVerification handles POST /api/v1/auth/email/verification/request:
+	// decodes the request body and always responds with a generic message,
+	// regardless of whether the email exists.
+	RequestEmailVerification(w http.ResponseWriter, r *http.Request)
+	// VerifyEmail handles POST /api/v1/auth/email/verification/verify:
+	// consumes the token, marks the account's email verified, and writes the
+	// account's public representation.
+	VerifyEmail(w http.ResponseWriter, r *http.Request)
+	// RequestPasswordReset handles POST /api/v1/auth/password/reset/request:
+	// decodes the request body and always responds with a generic message,
+	// regardless of whether the email exists.
+	RequestPasswordReset(w http.ResponseWriter, r *http.Request)
+	// ResetPassword handles POST /api/v1/auth/password/reset/confirm:
+	// consumes the token, replaces the account's password, and revokes every
+	// active session for the account.
+	ResetPassword(w http.ResponseWriter, r *http.Request)
 }
 
-// MeHandler defines the HTTP endpoints for the authenticated current-user resource.
-type MeHandler interface {
+// UserHandler defines the HTTP endpoints for the authenticated current-user resource.
+type UserHandler interface {
 	// GetMe handles GET /api/v1/me: returns the authenticated user's profile
 	// and active plan. Requires a valid access token.
 	GetMe(w http.ResponseWriter, r *http.Request)

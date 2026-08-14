@@ -17,20 +17,25 @@ import (
 	"github.com/google/uuid"
 )
 
-const sessionDuration = 30 * 24 * time.Hour // 30 days
+const (
+	sessionDuration                = 30 * 24 * time.Hour // 30 days
+	emailVerificationTokenDuration = 24 * time.Hour
+	passwordResetTokenDuration     = time.Hour
+)
 
 // authService implements AuthService by combining the embedded shared
 // repository with the business rules for authentication.
 type authService struct {
 	repository.Repository
-	cfg config.Config
+	cfg   config.Config
+	email EmailService
 }
 
-// NewAuthService builds an authService backed by the given repositories and
-// application config, embedding the repository so auth flows can reach all
-// entity repositories and WithinTx directly.
-func NewAuthService(repos repository.Repository, cfg config.Config) *authService {
-	return &authService{Repository: repos, cfg: cfg}
+// NewAuthService builds an authService backed by the given repositories,
+// application config, and email service, embedding the repository so auth
+// flows can reach all entity repositories and WithinTx directly.
+func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService) *authService {
+	return &authService{Repository: repos, cfg: cfg, email: emailSvc}
 }
 
 // Register handles user registration: it normalizes and validates the input,
@@ -39,30 +44,30 @@ func NewAuthService(repos repository.Repository, cfg config.Config) *authService
 // On success it issues a TokenPair and returns the created user with it;
 // failures return msgs.ErrInvalidCredentials, msgs.ErrEmailAlreadyExists, or
 // the underlying repository error.
-func (s *authService) Register(ctx context.Context, input models.RegisterInput) (models.User, TokenPair, error) {
+func (s *authService) Register(ctx context.Context, input models.RegisterInput) (models.User, models.TokenPair, error) {
 	email := validate.NormalizeEmail(input.Email)
 
 	if !validate.Email(email) {
-		return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 	if !validate.Password(input.Password) {
-		return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 	if !validate.Name(input.Name) {
-		return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
 	_, err := s.User().GetUserByEmail(ctx, email)
 	if err == nil {
-		return models.User{}, TokenPair{}, msgs.ErrEmailAlreadyExists
+		return models.User{}, models.TokenPair{}, msgs.ErrEmailAlreadyExists
 	}
 	if !errors.Is(err, msgs.ErrUserNotFound) {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	passwordHash, err := hash.HashPassword(input.Password)
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	var createdUser models.User
@@ -102,13 +107,13 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 		return err
 	})
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	// New registrations are always on the free plan — no extra query needed.
 	pair, err := s.issueTokenPair(ctx, createdUser.ID, models.FreePlan.String())
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	return createdUser, pair, nil
@@ -123,52 +128,52 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 // msgs.ErrInvalidCredentials so the response never reveals whether the email
 // exists (account-enumeration defense). Unexpected repository or hashing
 // failures are returned wrapped.
-func (s *authService) Login(ctx context.Context, input models.LoginInput) (models.User, TokenPair, error) {
+func (s *authService) Login(ctx context.Context, input models.LoginInput) (models.User, models.TokenPair, error) {
 	email := validate.NormalizeEmail(input.Email)
 
 	if !validate.Email(email) {
-		return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 	if !validate.Password(input.Password) {
-		return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
 	identity, err := s.AuthIdentity().GetAuthIdentityByProviderAndSubject(ctx, "password", email)
 	if err != nil {
 		if errors.Is(err, msgs.ErrUserNotFound) {
-			return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+			return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 		}
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	// An identity without a password hash (e.g. an OAuth-only account) cannot
 	// authenticate by password; return the generic error rather than
 	// msgs.ErrPasswordNotSet so login never reveals that the account exists.
 	if identity.PasswordHash == nil {
-		return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
 	ok, err := hash.VerifyPassword(input.Password, *identity.PasswordHash)
 	if err != nil {
-		return models.User{}, TokenPair{}, fmt.Errorf("error verifying password: %w", err)
+		return models.User{}, models.TokenPair{}, fmt.Errorf("error verifying password: %w", err)
 	}
 	if !ok {
-		return models.User{}, TokenPair{}, msgs.ErrInvalidCredentials
+		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
 	user, err := s.User().GetUserByID(ctx, identity.UserID)
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, user.ID)
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	pair, err := s.issueTokenPair(ctx, user.ID, sub.PlanID)
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	return user, pair, nil
@@ -181,12 +186,12 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 // msgs.ErrTokenReuseDetected and revokes the entire token family to limit
 // the blast radius of a stolen token. Expired or unknown tokens return
 // msgs.ErrTokenInvalid.
-func (s *authService) Refresh(ctx context.Context, rawRefreshToken string) (models.User, TokenPair, error) {
+func (s *authService) Refresh(ctx context.Context, rawRefreshToken string) (models.User, models.TokenPair, error) {
 	tokenHash := token.Hash(rawRefreshToken)
 
 	session, err := s.Session().GetSessionByTokenHash(ctx, tokenHash)
 	if err != nil {
-		return models.User{}, TokenPair{}, err // msgs.ErrTokenInvalid from repo
+		return models.User{}, models.TokenPair{}, err // msgs.ErrTokenInvalid from repo
 	}
 
 	// A revoked_at that is set means this session was already consumed via
@@ -194,26 +199,26 @@ func (s *authService) Refresh(ctx context.Context, rawRefreshToken string) (mode
 	// signal — revoke the whole token family defensively.
 	if session.RevokedAt != nil {
 		_ = s.Session().RevokeSessionFamily(ctx, session.TokenFamilyID)
-		return models.User{}, TokenPair{}, msgs.ErrTokenReuseDetected
+		return models.User{}, models.TokenPair{}, msgs.ErrTokenReuseDetected
 	}
 
 	if time.Now().After(session.ExpiresAt) {
-		return models.User{}, TokenPair{}, msgs.ErrTokenInvalid
+		return models.User{}, models.TokenPair{}, msgs.ErrTokenInvalid
 	}
 
 	user, err := s.User().GetUserByID(ctx, session.UserID)
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, user.ID)
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	// Rotate inside a transaction: consume the old session and create the new
 	// one atomically so there is never a window with two valid tokens.
-	var pair TokenPair
+	var pair models.TokenPair
 	err = s.WithinTx(ctx, func(ctx context.Context) error {
 		if err := s.Session().MarkSessionConsumed(ctx, session.ID); err != nil {
 			return err
@@ -228,7 +233,7 @@ func (s *authService) Refresh(ctx context.Context, rawRefreshToken string) (mode
 		return nil
 	})
 	if err != nil {
-		return models.User{}, TokenPair{}, err
+		return models.User{}, models.TokenPair{}, err
 	}
 
 	return user, pair, nil
@@ -252,53 +257,153 @@ func (s *authService) LogoutAll(ctx context.Context, userID uuid.UUID) error {
 	return nil
 }
 
-// GetMe returns the user identified by userID together with their active
-// subscription. It returns msgs.ErrUserNotFound when no user matches and
-// msgs.ErrSubscriptionNotFound when the user has no active subscription.
-func (s *authService) GetMe(ctx context.Context, userID uuid.UUID) (models.User, models.Subscription, error) {
-	user, err := s.User().GetUserByID(ctx, userID)
+// RequestEmailVerification issues a new email verification token for email
+// and sends it via EmailService. Unknown or already-verified emails are a
+// silent no-op so the caller can always respond generically.
+func (s *authService) RequestEmailVerification(ctx context.Context, email string) error {
+	email = validate.NormalizeEmail(email)
+	if !validate.Email(email) {
+		return nil
+	}
+
+	user, err := s.User().GetUserByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, msgs.ErrUserNotFound) {
+			return nil
+		}
+		return err
+	}
+	if user.EmailVerifiedAt != nil {
+		return nil
+	}
+
+	rawToken, err := token.Generate()
+	if err != nil {
+		return err
+	}
+
+	_, err = s.EmailVerificationToken().CreateEmailVerificationToken(ctx, models.EmailVerificationToken{
+		ID:        uuid.New(),
+		UserID:    user.ID,
+		TokenHash: token.Hash(rawToken),
+		ExpiresAt: time.Now().Add(emailVerificationTokenDuration),
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := s.email.SendVerificationEmail(ctx, email, rawToken); err != nil {
+		return fmt.Errorf("sending verification email: %w", err)
+	}
+	return nil
+}
+
+// VerifyEmail consumes an email verification token: it validates the token,
+// marks the owning user's email verified, consumes the token, and returns
+// the user plus their active subscription.
+func (s *authService) VerifyEmail(ctx context.Context, rawToken string) (models.User, models.Subscription, error) {
+	tokenHash := token.Hash(rawToken)
+
+	t, err := s.EmailVerificationToken().GetEmailVerificationTokenByHash(ctx, tokenHash)
+	if err != nil {
+		return models.User{}, models.Subscription{}, err // msgs.ErrTokenInvalid from repo
+	}
+	if t.UsedAt != nil {
+		return models.User{}, models.Subscription{}, msgs.ErrTokenAlreadyUsed
+	}
+	if time.Now().After(t.ExpiresAt) {
+		return models.User{}, models.Subscription{}, msgs.ErrTokenInvalid
+	}
+
+	err = s.WithinTx(ctx, func(ctx context.Context) error {
+		if err := s.User().UpdateEmailVerifiedAt(ctx, t.UserID); err != nil {
+			return err
+		}
+		return s.EmailVerificationToken().MarkEmailVerificationTokenConsumed(ctx, t.ID)
+	})
 	if err != nil {
 		return models.User{}, models.Subscription{}, err
 	}
-	sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, userID)
+
+	user, err := s.User().GetUserByID(ctx, t.UserID)
+	if err != nil {
+		return models.User{}, models.Subscription{}, err
+	}
+	sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, t.UserID)
 	if err != nil {
 		return models.User{}, models.Subscription{}, err
 	}
 	return user, sub, nil
 }
 
-// ChangePassword verifies the caller's current password, replaces it with a
-// hash of newPassword, and revokes all other active sessions so that any stolen
-// refresh tokens are immediately invalidated. The current session (identified
-// by sessionID) is kept alive so the caller does not need to re-authenticate.
-//
-// Error cases:
-//   - msgs.ErrPasswordNotSet — account has no password identity (OAuth-only)
-//   - msgs.ErrInvalidCredentials — currentPassword does not match the stored hash
-//   - msgs.ErrInvalidCredentials — newPassword fails validation
-func (s *authService) ChangePassword(ctx context.Context, userID uuid.UUID, sessionID uuid.UUID, currentPassword, newPassword string) error {
+// RequestPasswordReset issues a new password reset token for email and
+// sends it via EmailService. An unknown email is a silent no-op so the
+// caller can always respond generically.
+func (s *authService) RequestPasswordReset(ctx context.Context, email string) error {
+	email = validate.NormalizeEmail(email)
+	if !validate.Email(email) {
+		return nil
+	}
+
+	user, err := s.User().GetUserByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, msgs.ErrUserNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	rawToken, err := token.Generate()
+	if err != nil {
+		return err
+	}
+
+	_, err = s.PasswordResetToken().CreatePasswordResetToken(ctx, models.PasswordResetToken{
+		ID:        uuid.New(),
+		UserID:    user.ID,
+		TokenHash: token.Hash(rawToken),
+		ExpiresAt: time.Now().Add(passwordResetTokenDuration),
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := s.email.SendPasswordResetEmail(ctx, email, rawToken); err != nil {
+		return fmt.Errorf("sending password reset email: %w", err)
+	}
+	return nil
+}
+
+// ResetPassword consumes a password reset token: it validates the token and
+// newPassword, replaces the account's password hash, consumes the token,
+// and revokes every active session for the account.
+func (s *authService) ResetPassword(ctx context.Context, rawToken string, newPassword string) error {
 	if !validate.Password(newPassword) {
 		return msgs.ErrInvalidCredentials
 	}
 
-	identity, err := s.AuthIdentity().GetAuthIdentityByUserIDAndProvider(ctx, userID, "password")
+	tokenHash := token.Hash(rawToken)
+
+	t, err := s.PasswordResetToken().GetPasswordResetTokenByHash(ctx, tokenHash)
+	if err != nil {
+		return err // msgs.ErrTokenInvalid from repo
+	}
+	if t.UsedAt != nil {
+		return msgs.ErrTokenAlreadyUsed
+	}
+	if time.Now().After(t.ExpiresAt) {
+		return msgs.ErrTokenInvalid
+	}
+
+	identity, err := s.AuthIdentity().GetAuthIdentityByUserIDAndProvider(ctx, t.UserID, "password")
 	if err != nil {
 		if errors.Is(err, msgs.ErrUserNotFound) {
 			return msgs.ErrPasswordNotSet
 		}
 		return err
 	}
-
 	if identity.PasswordHash == nil {
 		return msgs.ErrPasswordNotSet
-	}
-
-	ok, err := hash.VerifyPassword(currentPassword, *identity.PasswordHash)
-	if err != nil {
-		return fmt.Errorf("verifying current password: %w", err)
-	}
-	if !ok {
-		return msgs.ErrInvalidCredentials
 	}
 
 	newHash, err := hash.HashPassword(newPassword)
@@ -307,29 +412,32 @@ func (s *authService) ChangePassword(ctx context.Context, userID uuid.UUID, sess
 	}
 
 	return s.WithinTx(ctx, func(ctx context.Context) error {
-		if err := s.AuthIdentity().UpdatePasswordHash(ctx, userID, newHash); err != nil {
+		if err := s.AuthIdentity().UpdatePasswordHash(ctx, t.UserID, newHash); err != nil {
 			return err
 		}
-		return s.Session().RevokeOtherSessionsForUser(ctx, userID, sessionID)
+		if err := s.PasswordResetToken().MarkPasswordResetTokenConsumed(ctx, t.ID); err != nil {
+			return err
+		}
+		return s.Session().RevokeAllSessionsForUser(ctx, t.UserID)
 	})
 }
 
 // issueTokenPair generates a fresh token pair starting a new token family.
 // Called at the end of registration and login.
-func (s *authService) issueTokenPair(ctx context.Context, userID uuid.UUID, planKey string) (TokenPair, error) {
+func (s *authService) issueTokenPair(ctx context.Context, userID uuid.UUID, planKey string) (models.TokenPair, error) {
 	return s.issueTokenPairInFamily(ctx, userID, planKey, uuid.New())
 }
 
 // issueTokenPairInFamily generates a new refresh token + session in the given
 // token family, signs a short-lived JWT access token, and returns both as a
-// TokenPair. familyID is uuid.New() on first issuance and the existing family
-// UUID on rotation, preserving the revocation lineage across refreshes. The
-// planKey is embedded in the JWT so protected handlers can authorize without
-// a database round-trip.
-func (s *authService) issueTokenPairInFamily(ctx context.Context, userID uuid.UUID, planKey string, familyID uuid.UUID) (TokenPair, error) {
+// models.TokenPair. familyID is uuid.New() on first issuance and the existing
+// family UUID on rotation, preserving the revocation lineage across
+// refreshes. The planKey is embedded in the JWT so protected handlers can
+// authorize without a database round-trip.
+func (s *authService) issueTokenPairInFamily(ctx context.Context, userID uuid.UUID, planKey string, familyID uuid.UUID) (models.TokenPair, error) {
 	rawToken, err := token.Generate()
 	if err != nil {
-		return TokenPair{}, err
+		return models.TokenPair{}, err
 	}
 
 	session, err := s.Session().CreateSession(ctx, models.Session{
@@ -340,13 +448,13 @@ func (s *authService) issueTokenPairInFamily(ctx context.Context, userID uuid.UU
 		ExpiresAt:        time.Now().Add(sessionDuration),
 	})
 	if err != nil {
-		return TokenPair{}, err
+		return models.TokenPair{}, err
 	}
 
 	accessToken, err := jwttoken.Issue(s.cfg.JWTSecret, userID, session.ID, planKey)
 	if err != nil {
-		return TokenPair{}, err
+		return models.TokenPair{}, err
 	}
 
-	return TokenPair{AccessToken: accessToken, RawRefreshToken: rawToken}, nil
+	return models.TokenPair{AccessToken: accessToken, RawRefreshToken: rawToken}, nil
 }

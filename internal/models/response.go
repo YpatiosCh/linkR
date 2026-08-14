@@ -27,6 +27,8 @@ type MePlanResponse struct {
 
 // MeResponse is the JSON body returned by GET /api/v1/me, wrapped under a
 // "data" key. It exposes only safe account fields — never hashes or tokens.
+// It is also reused by POST /api/v1/auth/email/verification/verify, which
+// returns the same "public account representation" per the auth spec.
 type MeResponse struct {
 	ID            string         `json:"id"`
 	Email         string         `json:"email"`
@@ -34,4 +36,12 @@ type MeResponse struct {
 	Name          string         `json:"name"`
 	AvatarURL     *string        `json:"avatar_url,omitempty"`
 	Plan          MePlanResponse `json:"plan"`
+}
+
+// MessageResponse is the JSON body returned by the intentionally generic
+// "request" endpoints (email verification request, password reset request),
+// wrapped under a "data" key. It never reveals whether the requested email
+// exists.
+type MessageResponse struct {
+	Message string `json:"message"`
 }

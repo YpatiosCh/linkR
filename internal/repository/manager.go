@@ -9,22 +9,26 @@ import (
 // RepoManager is the concrete Repository implementation. It owns a
 // pgxpool.Pool and the per-entity repository instances bound to it.
 type RepoManager struct {
-	pool             *pgxpool.Pool
-	userRepo         UserRepository
-	authIdentityRepo AuthIdentityRepository
-	subscriptionRepo SubscriptionRepository
-	sessionRepo      SessionRepository
+	pool                       *pgxpool.Pool
+	userRepo                   UserRepository
+	authIdentityRepo           AuthIdentityRepository
+	subscriptionRepo           SubscriptionRepository
+	sessionRepo                SessionRepository
+	emailVerificationTokenRepo EmailVerificationTokenRepository
+	passwordResetTokenRepo     PasswordResetTokenRepository
 }
 
 // NewRepoManager wires the pool into each entity repository and returns
 // them behind the Repository interface.
 func NewRepoManager(pool *pgxpool.Pool) Repository {
 	return &RepoManager{
-		pool:             pool,
-		userRepo:         NewUserRepository(pool),
-		authIdentityRepo: NewAuthIdentityRepository(pool),
-		subscriptionRepo: NewSubscriptionRepository(pool),
-		sessionRepo:      NewSessionRepository(pool),
+		pool:                       pool,
+		userRepo:                   NewUserRepository(pool),
+		authIdentityRepo:           NewAuthIdentityRepository(pool),
+		subscriptionRepo:           NewSubscriptionRepository(pool),
+		sessionRepo:                NewSessionRepository(pool),
+		emailVerificationTokenRepo: NewEmailVerificationTokenRepository(pool),
+		passwordResetTokenRepo:     NewPasswordResetTokenRepository(pool),
 	}
 }
 
@@ -65,4 +69,14 @@ func (r *RepoManager) Subscription() SubscriptionRepository {
 // Session returns the session repository.
 func (r *RepoManager) Session() SessionRepository {
 	return r.sessionRepo
+}
+
+// EmailVerificationToken returns the email verification token repository.
+func (r *RepoManager) EmailVerificationToken() EmailVerificationTokenRepository {
+	return r.emailVerificationTokenRepo
+}
+
+// PasswordResetToken returns the password reset token repository.
+func (r *RepoManager) PasswordResetToken() PasswordResetTokenRepository {
+	return r.passwordResetTokenRepo
 }

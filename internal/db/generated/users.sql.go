@@ -91,3 +91,12 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 	)
 	return i, err
 }
+
+const updateEmailVerifiedAt = `-- name: UpdateEmailVerifiedAt :exec
+UPDATE users SET email_verified_at = now() WHERE id = $1
+`
+
+func (q *Queries) UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, updateEmailVerifiedAt, id)
+	return err
+}

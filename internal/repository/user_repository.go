@@ -88,6 +88,17 @@ func (r *userRepository) GetUserByID(ctx context.Context, id uuid.UUID) (models.
 	return dbUserToDomain(row), nil
 }
 
+// UpdateEmailVerifiedAt sets email_verified_at = now() on the user with the
+// given ID, marking their email as verified. Any database error is wrapped
+// with context.
+func (r *userRepository) UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error {
+	q := r.querier(ctx)
+	if err := q.UpdateEmailVerifiedAt(ctx, id); err != nil {
+		return fmt.Errorf("updating email verified at: %w", err)
+	}
+	return nil
+}
+
 // dbUserToDomain maps a sqlc db.User row to a domain models.User,
 // converting nullable pgtype fields (AvatarUrl, EmailVerifiedAt) into
 // nil-able pointers.

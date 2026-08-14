@@ -24,6 +24,10 @@ type Repository interface {
 	Subscription() SubscriptionRepository
 	// Session returns the session repository.
 	Session() SessionRepository
+	// EmailVerificationToken returns the email verification token repository.
+	EmailVerificationToken() EmailVerificationTokenRepository
+	// PasswordResetToken returns the password reset token repository.
+	PasswordResetToken() PasswordResetTokenRepository
 }
 
 // UserRepository defines the data-access operations for users.
@@ -37,6 +41,9 @@ type UserRepository interface {
 	// GetUserByID returns the non-deleted user with the given ID, or an
 	// error when no such user exists.
 	GetUserByID(ctx context.Context, id uuid.UUID) (models.User, error)
+	// UpdateEmailVerifiedAt sets email_verified_at to now() on the given
+	// user, marking their email as verified.
+	UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error
 }
 
 // AuthIdentityRepository defines the data-access operations for auth
@@ -94,4 +101,36 @@ type SessionRepository interface {
 	// belonging to the given user except the session with keepSessionID, used
 	// during password change to keep the current session alive.
 	RevokeOtherSessionsForUser(ctx context.Context, userID uuid.UUID, keepSessionID uuid.UUID) error
+}
+
+// EmailVerificationTokenRepository defines the data-access operations for
+// email verification tokens.
+type EmailVerificationTokenRepository interface {
+	// CreateEmailVerificationToken persists a new token and returns the
+	// stored token.
+	CreateEmailVerificationToken(ctx context.Context, t models.EmailVerificationToken) (models.EmailVerificationToken, error)
+	// GetEmailVerificationTokenByHash returns the token whose token_hash
+	// matches the given hash, including already-used ones, so callers can
+	// distinguish a consumed token from one that never existed. Returns
+	// msgs.ErrTokenInvalid when no token matches.
+	GetEmailVerificationTokenByHash(ctx context.Context, tokenHash string) (models.EmailVerificationToken, error)
+	// MarkEmailVerificationTokenConsumed sets used_at on the token with the
+	// given ID.
+	MarkEmailVerificationTokenConsumed(ctx context.Context, id uuid.UUID) error
+}
+
+// PasswordResetTokenRepository defines the data-access operations for
+// password reset tokens.
+type PasswordResetTokenRepository interface {
+	// CreatePasswordResetToken persists a new token and returns the stored
+	// token.
+	CreatePasswordResetToken(ctx context.Context, t models.PasswordResetToken) (models.PasswordResetToken, error)
+	// GetPasswordResetTokenByHash returns the token whose token_hash matches
+	// the given hash, including already-used ones, so callers can
+	// distinguish a consumed token from one that never existed. Returns
+	// msgs.ErrTokenInvalid when no token matches.
+	GetPasswordResetTokenByHash(ctx context.Context, tokenHash string) (models.PasswordResetToken, error)
+	// MarkPasswordResetTokenConsumed sets used_at on the token with the
+	// given ID.
+	MarkPasswordResetTokenConsumed(ctx context.Context, id uuid.UUID) error
 }

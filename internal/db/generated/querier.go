@@ -12,20 +12,27 @@ import (
 
 type Querier interface {
 	CreateAuthIdentity(ctx context.Context, arg CreateAuthIdentityParams) (AuthIdentity, error)
+	CreateEmailVerificationToken(ctx context.Context, arg CreateEmailVerificationTokenParams) (EmailVerificationToken, error)
+	CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	CreateUserSubscription(ctx context.Context, arg CreateUserSubscriptionParams) (UserSubscription, error)
 	GetActiveSubscriptionByUserID(ctx context.Context, userID uuid.UUID) (UserSubscription, error)
 	GetAuthIdentityByProviderAndSubject(ctx context.Context, arg GetAuthIdentityByProviderAndSubjectParams) (AuthIdentity, error)
 	GetAuthIdentityByUserIDAndProvider(ctx context.Context, arg GetAuthIdentityByUserIDAndProviderParams) (AuthIdentity, error)
+	GetEmailVerificationTokenByHash(ctx context.Context, tokenHash string) (EmailVerificationToken, error)
+	GetPasswordResetTokenByHash(ctx context.Context, tokenHash string) (PasswordResetToken, error)
 	GetSessionByTokenHash(ctx context.Context, refreshTokenHash string) (Session, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (User, error)
+	MarkEmailVerificationTokenConsumed(ctx context.Context, id uuid.UUID) error
+	MarkPasswordResetTokenConsumed(ctx context.Context, id uuid.UUID) error
 	MarkSessionConsumed(ctx context.Context, id uuid.UUID) error
 	RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) error
 	RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) error
 	RevokeSession(ctx context.Context, id uuid.UUID) error
 	RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) error
+	UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error
 	UpdatePasswordHash(ctx context.Context, arg UpdatePasswordHashParams) error
 }
 
