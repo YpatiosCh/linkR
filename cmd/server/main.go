@@ -28,6 +28,9 @@ func main() {
 	if cfg.JWTSecret == "" {
 		log.Fatal("JWT_SECRET is not set")
 	}
+	if cfg.ResendAPIKey == "" {
+		log.Fatal("RESEND_API_KEY is not set")
+	}
 
 	pool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
 	if err != nil {
