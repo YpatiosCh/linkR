@@ -9,11 +9,49 @@ services:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d digital_delivery"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7-alpine
     ports:
       - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Secrets and everything else (JWT_SECRET, RESEND_API_KEY, EMAIL_FROM,
+    # FRONTEND_URL, GOOGLE_CLIENT_ID/SECRET/REDIRECT_URL, ...) come from .env.
+    # DATABASE_URL/REDIS_ADDR are overridden below to point at the compose
+    # network's service hostnames instead of the host-mapped localhost ports
+    # .env uses for native `go run`.
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/digital_delivery?sslmode=disable
+      REDIS_ADDR: redis:6379
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # `depends_on`'s health-gating only applies to `up` — `docker compose
+    # restart` restarts all services at once and ignores it, so the app can
+    # still lose the startup race against postgres there. Bounded
+    # auto-restart covers that case (and any other transient dependency
+    # blip) without masking a genuinely broken config forever.
+    restart: on-failure:5
 
 volumes:
   pgdata:
