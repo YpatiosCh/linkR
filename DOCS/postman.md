@@ -23,6 +23,10 @@ email actually get sent?**
    it's unset (`cmd/server/main.go`). Use a real key and set
    `EMAIL_FROM=onboarding@resend.dev` (Resend's built-in sandbox sender — no
    domain verification needed) to send through Resend for real.
+   `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_REDIRECT_URL` are also
+   required at startup (see the `.env.example` comments) — from a Google
+   Cloud Console OAuth client with `http://localhost:8080/api/v1/auth/google/callback`
+   registered as an authorized redirect URI.
 4. Run the server:
    ```bash
    go run ./cmd/server
@@ -89,7 +93,28 @@ Either way, open the link/preview from the inbox or dashboard, extract the
    run **Login** again with `new_password` to get a fresh one.
 8. **Logout** / **Logout All** — whenever you're done with a session.
 
-## 5. Rate limits while testing
+## 5. Google OAuth login/signup
+
+`GET /api/v1/auth/google` and `GET /api/v1/auth/google/callback` are **not**
+JSON endpoints — both always respond with an HTTP redirect (302), so
+Postman's request runner and test scripts aren't useful here. Test these two
+in a real browser instead:
+
+1. Open `{{base_url}}/api/v1/auth/google` directly in a browser tab.
+2. You'll land on Google's consent screen; sign in and approve.
+3. Google redirects back to the callback endpoint, which redirects again to
+   `FRONTEND_URL` with the `access_token`/`refresh_token` cookies set (or to
+   `FRONTEND_URL?error=oauth_failed` / `?error=oauth_state_invalid` on
+   failure — check the server log for the underlying error).
+4. From there, cookie-based requests (e.g. **Get Me**) work the same as after
+   a password Login.
+
+The two entries in the collection (`Google: Start` and `Google: Callback`)
+are included for reference/documentation only — Postman will follow the
+redirects and typically report a JSON-parse failure on the final HTML page
+Google or your frontend serves, which is expected.
+
+## 6. Rate limits while testing
 
 Defined per-route in `internal/router/router.go`. The two you're most likely
 to hit while manually testing email flows:
@@ -105,7 +130,7 @@ Token lifetimes: verification tokens last 24h, reset tokens 1h
 (`internal/service/auth_service.go`) — a token you grabbed earlier in a
 session is still valid for a while if you didn't get to use it immediately.
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 - **401 on a protected route** — the access token is a 15-minute JWT
   (`jwttoken.AccessTokenDuration`). Run **Login** again to refresh

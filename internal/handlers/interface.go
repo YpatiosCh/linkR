@@ -47,6 +47,15 @@ type AuthHandler interface {
 	// consumes the token, replaces the account's password, and revokes every
 	// active session for the account.
 	ResetPassword(w http.ResponseWriter, r *http.Request)
+	// GoogleStart handles GET /api/v1/auth/google: generates a CSRF state
+	// value, signs it into a short-lived cookie, and redirects to Google's
+	// consent screen.
+	GoogleStart(w http.ResponseWriter, r *http.Request)
+	// GoogleCallback handles GET /api/v1/auth/google/callback: validates the
+	// state cookie against the query parameter, exchanges the authorization
+	// code, signs the user in, sets the auth cookies, and redirects to the
+	// frontend.
+	GoogleCallback(w http.ResponseWriter, r *http.Request)
 }
 
 // UserHandler defines the HTTP endpoints for the authenticated current-user resource.

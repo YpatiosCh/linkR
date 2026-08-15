@@ -6,14 +6,38 @@
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
-    { "key": "base_url", "value": "http://localhost:8080" },
-    { "key": "test_email", "value": "ada@example.com" },
-    { "key": "test_password", "value": "correct-horse-battery" },
-    { "key": "new_password", "value": "new-correct-horse-battery" },
-    { "key": "access_token", "value": "" },
-    { "key": "refresh_token", "value": "" },
-    { "key": "verification_token", "value": "" },
-    { "key": "reset_token", "value": "" }
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "test_email",
+      "value": "ada@example.com"
+    },
+    {
+      "key": "test_password",
+      "value": "correct-horse-battery"
+    },
+    {
+      "key": "new_password",
+      "value": "new-correct-horse-battery"
+    },
+    {
+      "key": "access_token",
+      "value": ""
+    },
+    {
+      "key": "refresh_token",
+      "value": ""
+    },
+    {
+      "key": "verification_token",
+      "value": ""
+    },
+    {
+      "key": "reset_token",
+      "value": ""
+    }
   ],
   "item": [
     {
@@ -26,8 +50,12 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/health",
-              "host": ["{{base_url}}"],
-              "path": ["health"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
             "description": "200 OK, plain text \"ok\". Public, no rate limit."
           },
@@ -57,19 +85,33 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\",\n  \"name\": \"Ada Lovelace\"\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{base_url}}/api/v1/auth/register",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "register"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "register"
+              ]
             },
-            "description": "201 Created. Body: {id, email, name, expires_at}. Sets access_token + refresh_token HttpOnly cookies — this request's test script reads them via pm.cookies.get(...) and stores them in the access_token/refresh_token collection variables automatically. Rate limit: 5/hour. 409 EMAIL_ALREADY_EXISTS if test_email is already registered — just Login instead."
+            "description": "201 Created. Body: {id, email, name, expires_at}. Sets access_token + refresh_token HttpOnly cookies \u2014 this request's test script reads them via pm.cookies.get(...) and stores them in the access_token/refresh_token collection variables automatically. Rate limit: 5/hour. 409 EMAIL_ALREADY_EXISTS if test_email is already registered \u2014 just Login instead."
           },
           "response": []
         },
@@ -92,17 +134,31 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\"\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{base_url}}/api/v1/auth/login",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "login"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "login"
+              ]
             },
             "description": "200 OK, same body/cookie shape as Register. 401 INVALID_CREDENTIALS covers unknown email, wrong password, and OAuth-only accounts identically (enumeration defense). Rate limit: 10/15min."
           },
@@ -127,14 +183,24 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Cookie", "value": "refresh_token={{refresh_token}}" }
+              {
+                "key": "Cookie",
+                "value": "refresh_token={{refresh_token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/v1/auth/refresh",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "refresh"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "refresh"
+              ]
             },
-            "description": "200 OK. Body: {expires_at}. The handler reads the refresh token from a Cookie header (not Authorization) — sent explicitly above from the refresh_token variable rather than relying on Postman's cookie jar to resend a Secure cookie over plain http. Rotates both tokens (this request's test script re-captures them). Running Refresh twice with the same now-stale refresh_token triggers reuse detection: 401 TOKEN_REUSE_DETECTED and the whole session family is revoked. Rate limit: 60/15min."
+            "description": "200 OK. Body: {expires_at}. The handler reads the refresh token from a Cookie header (not Authorization) \u2014 sent explicitly above from the refresh_token variable rather than relying on Postman's cookie jar to resend a Secure cookie over plain http. Rotates both tokens (this request's test script re-captures them). Running Refresh twice with the same now-stale refresh_token triggers reuse detection: 401 TOKEN_REUSE_DETECTED and the whole session family is revoked. Rate limit: 60/15min."
           },
           "response": []
         },
@@ -143,12 +209,22 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/v1/auth/logout",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "logout"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "logout"
+              ]
             },
             "description": "204 No Content. Revokes the current session (identified by the access token's session claim) and is idempotent. Requires RequireAuth. Rate limit: 10/15min."
           },
@@ -159,14 +235,77 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/v1/auth/logout-all",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "logout-all"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "logout-all"
+              ]
             },
             "description": "204 No Content. Revokes every active session for the user. Requires RequireAuth. Rate limit: 5/15min."
+          },
+          "response": []
+        },
+        {
+          "name": "Google: Start",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/google",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google"
+              ]
+            },
+            "description": "Redirects (302) to Google's consent screen and sets a short-lived signed oauth_state cookie. Not a JSON endpoint \u2014 open in a browser rather than running via Postman's test runner. Rate limit: 10/15min."
+          },
+          "response": []
+        },
+        {
+          "name": "Google: Callback",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/google/callback?code=&state=",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "code",
+                  "value": ""
+                },
+                {
+                  "key": "state",
+                  "value": ""
+                }
+              ]
+            },
+            "description": "Google redirects here after consent with ?code=&state=. Validates the oauth_state cookie against state, exchanges code, and on success sets the same access_token/refresh_token cookies as Login before redirecting (302) to FRONTEND_URL. On failure redirects to FRONTEND_URL?error=oauth_failed or ?error=oauth_state_invalid. Not directly usable from Postman's test runner \u2014 exercise the full flow in a browser starting from Google: Start. Rate limit: 10/15min."
           },
           "response": []
         }
@@ -180,12 +319,21 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/v1/me",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "me"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "me"
+              ]
             },
             "description": "200 OK. Body: {data: {id, email, email_verified, name, avatar_url, plan: {id, status}}}. Requires RequireAuth. Rate limit: 60/15min."
           },
@@ -196,18 +344,36 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"current_password\": \"{{test_password}}\",\n  \"new_password\": \"{{new_password}}\"\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{base_url}}/api/v1/me/password/change",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "me", "password", "change"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "me",
+                "password",
+                "change"
+              ]
             },
             "description": "204 No Content. Verifies current_password, hashes new_password, and revokes every OTHER active session (this one stays alive). Requires RequireAuth. Rate limit: 5/15min. After running this, either update test_password to match new_password, or use new_password directly on the next Login."
           },
@@ -223,19 +389,35 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"email\": \"{{test_email}}\"\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{base_url}}/api/v1/auth/email/verification/request",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "email", "verification", "request"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "email",
+                "verification",
+                "request"
+              ]
             },
-            "description": "200 OK ALWAYS, regardless of whether the email exists or is already verified (enumeration defense) — body: {data: {message: \"...\"}}. This is where the actual email send happens. See DOCS/postman.md §\"Did we actually send an email?\" for how to check the Resend dashboard and grab the token for the next request. Rate limit: 5/hour — don't spam this while testing."
+            "description": "200 OK ALWAYS, regardless of whether the email exists or is already verified (enumeration defense) \u2014 body: {data: {message: \"...\"}}. This is where the actual email send happens. See DOCS/postman.md \u00a7\"Did we actually send an email?\" for how to check the Resend dashboard and grab the token for the next request. Rate limit: 5/hour \u2014 don't spam this while testing."
           },
           "response": []
         },
@@ -244,17 +426,33 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"token\": \"{{verification_token}}\"\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{base_url}}/api/v1/auth/email/verification/verify",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "email", "verification", "verify"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "email",
+                "verification",
+                "verify"
+              ]
             },
             "description": "Set the verification_token collection variable to the raw token from the email link (or the Resend dashboard preview) before running this. 200 OK: {data: <same shape as Get Me>}, with email_verified now true. 401 TOKEN_INVALID if unknown/expired, 401 TOKEN_ALREADY_USED if already consumed. Rate limit: 10/15min."
           },
@@ -270,19 +468,35 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"email\": \"{{test_email}}\"\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{base_url}}/api/v1/auth/password/reset/request",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "password", "reset", "request"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "password",
+                "reset",
+                "request"
+              ]
             },
-            "description": "200 OK ALWAYS: {data: {message: \"If an account exists, a password reset email has been sent.\"}} — enumeration defense, matches the auth spec's example verbatim. Check the Resend dashboard for the actual token, same as email verification. Rate limit: 5/hour."
+            "description": "200 OK ALWAYS: {data: {message: \"If an account exists, a password reset email has been sent.\"}} \u2014 enumeration defense, matches the auth spec's example verbatim. Check the Resend dashboard for the actual token, same as email verification. Rate limit: 5/hour."
           },
           "response": []
         },
@@ -291,19 +505,35 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"token\": \"{{reset_token}}\",\n  \"new_password\": \"{{new_password}}\"\n}",
-              "options": { "raw": { "language": "json" } }
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
             "url": {
               "raw": "{{base_url}}/api/v1/auth/password/reset/confirm",
-              "host": ["{{base_url}}"],
-              "path": ["api", "v1", "auth", "password", "reset", "confirm"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "password",
+                "reset",
+                "confirm"
+              ]
             },
-            "description": "204 No Content. Revokes ALL sessions for the account, including the one behind {{access_token}} — re-run Login afterward with new_password. 401 TOKEN_INVALID/TOKEN_ALREADY_USED, 400 PASSWORD_NOT_SET for OAuth-only accounts, 401 INVALID_CREDENTIALS if new_password is weak. Rate limit: 10/15min."
+            "description": "204 No Content. Revokes ALL sessions for the account, including the one behind {{access_token}} \u2014 re-run Login afterward with new_password. 401 TOKEN_INVALID/TOKEN_ALREADY_USED, 400 PASSWORD_NOT_SET for OAuth-only accounts, 401 INVALID_CREDENTIALS if new_password is weak. Rate limit: 10/15min."
           },
           "response": []
         }

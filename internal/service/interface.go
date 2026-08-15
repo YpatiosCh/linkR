@@ -74,6 +74,17 @@ type AuthService interface {
 	// consumed, msgs.ErrPasswordNotSet for an OAuth-only account, or
 	// msgs.ErrInvalidCredentials if newPassword is weak.
 	ResetPassword(ctx context.Context, token string, newPassword string) error
+	// GoogleAuthURL returns the URL to redirect the user to Google's consent
+	// screen, plus a freshly generated CSRF state value the caller must
+	// persist (e.g. in a signed cookie) and present back to GoogleCallback.
+	GoogleAuthURL(ctx context.Context) (authURL string, state string, err error)
+	// GoogleCallback exchanges the authorization code for Google's verified
+	// profile and signs the user in: an existing google identity signs in
+	// as-is; no google identity but a matching verified email attaches a new
+	// google identity to that existing account; no match at all creates a
+	// new user, google identity, and free subscription. Returns
+	// msgs.ErrOAuthEmailNotVerified if Google reports the email unverified.
+	GoogleCallback(ctx context.Context, code string) (models.User, models.TokenPair, error)
 }
 
 // UserService defines the operations exposed by the service layer for the

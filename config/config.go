@@ -28,6 +28,14 @@ type Config struct {
 	EmailFrom      string
 	FrontendURL    string
 	RedisClient    *redis.Client
+
+	// Google OAuth credentials. No defaults: GoogleRedirectURL in particular
+	// must exactly match what's registered in Google's console, so silently
+	// defaulting it would be dangerous. main validates all three are
+	// non-empty at startup, same as DatabaseURL/JWTSecret/ResendAPIKey.
+	GoogleClientID     string
+	GoogleClientSecret string
+	GoogleRedirectURL  string
 }
 
 // Load reads configuration from environment variables, falling back to the
@@ -51,5 +59,9 @@ func Load() Config {
 		EmailFrom:      dotenv.GetEnv("EMAIL_FROM", ""),
 		FrontendURL:    dotenv.GetEnv("FRONTEND_URL", "http://localhost:3000"),
 		RedisClient:    redis.NewClient(dotenv.GetEnv("REDIS_ADDR", "localhost:6380")),
+
+		GoogleClientID:     dotenv.GetEnv("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret: dotenv.GetEnv("GOOGLE_CLIENT_SECRET", ""),
+		GoogleRedirectURL:  dotenv.GetEnv("GOOGLE_REDIRECT_URL", ""),
 	}
 }

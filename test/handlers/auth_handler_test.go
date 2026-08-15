@@ -4,20 +4,28 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"linkMe/config"
 	"linkMe/internal/handlers"
 	"linkMe/internal/middleware"
 	"linkMe/internal/models"
 	"linkMe/internal/msgs"
 	"linkMe/internal/service"
 	"linkMe/internal/utils/jwttoken"
+	"linkMe/internal/utils/oauthstate"
 
 	"github.com/google/uuid"
 )
+
+// testHandlerCfg is the fixed application config used by every AuthHandler
+// constructed in this file: JWTSecret signs the OAuth state cookie,
+// FrontendURL is the redirect target for the Google OAuth endpoints.
+var testHandlerCfg = config.Config{JWTSecret: handlerTestSecret, FrontendURL: "https://app.example.com"}
 
 // --- fake service layer ---
 
@@ -31,6 +39,8 @@ type fakeAuthSvc struct {
 	verifyEmail              func(ctx context.Context, token string) (models.User, models.Subscription, error)
 	requestPasswordReset     func(ctx context.Context, email string) error
 	resetPassword            func(ctx context.Context, token string, newPassword string) error
+	googleAuthURL            func(ctx context.Context) (string, string, error)
+	googleCallback           func(ctx context.Context, code string) (models.User, models.TokenPair, error)
 }
 
 func (f *fakeAuthSvc) Register(ctx context.Context, input models.RegisterInput) (models.User, models.TokenPair, error) {
@@ -59,6 +69,12 @@ func (f *fakeAuthSvc) RequestPasswordReset(ctx context.Context, email string) er
 }
 func (f *fakeAuthSvc) ResetPassword(ctx context.Context, token string, newPassword string) error {
 	return f.resetPassword(ctx, token, newPassword)
+}
+func (f *fakeAuthSvc) GoogleAuthURL(ctx context.Context) (string, string, error) {
+	return f.googleAuthURL(ctx)
+}
+func (f *fakeAuthSvc) GoogleCallback(ctx context.Context, code string) (models.User, models.TokenPair, error) {
+	return f.googleCallback(ctx, code)
 }
 
 // fakeUserSvc is the fake service.UserService used by user-handler tests
@@ -153,6 +169,13 @@ func cookieMap(rec *httptest.ResponseRecorder) map[string]string {
 	return m
 }
 
+// redirectLocation returns the Location header of a redirect response, for
+// asserting the outcome of the Google OAuth endpoints (the only handlers in
+// this codebase that respond with a redirect rather than JSON).
+func redirectLocation(rec *httptest.ResponseRecorder) string {
+	return rec.Result().Header.Get("Location")
+}
+
 // --- Register ---
 
 func TestRegisterHandler_Success(t *testing.T) {
@@ -166,7 +189,7 @@ func TestRegisterHandler_Success(t *testing.T) {
 			}
 			return user, pair, nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.Register), "/api/v1/auth/register", map[string]string{
 		"email": "ada@example.com", "password": "correct-horse-battery", "name": "Ada",
@@ -208,7 +231,7 @@ func TestRegisterHandler_MalformedBody(t *testing.T) {
 			t.Fatal("service should not be called when body is malformed")
 			return models.User{}, models.TokenPair{}, nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewBufferString("not json{{"))
 	req.Header.Set("Content-Type", "application/json")
@@ -234,7 +257,7 @@ func TestRegisterHandler_EmailAlreadyExists(t *testing.T) {
 		register: func(_ context.Context, _ models.RegisterInput) (models.User, models.TokenPair, error) {
 			return models.User{}, models.TokenPair{}, msgs.ErrEmailAlreadyExists
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.Register), "/api/v1/auth/register", map[string]string{
 		"email": "taken@example.com", "password": "correct-horse-battery", "name": "Ada",
@@ -264,7 +287,7 @@ func TestLoginHandler_Success(t *testing.T) {
 		login: func(_ context.Context, input models.LoginInput) (models.User, models.TokenPair, error) {
 			return user, pair, nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.Login), "/api/v1/auth/login", map[string]string{
 		"email": "ada@example.com", "password": "correct-horse-battery",
@@ -302,7 +325,7 @@ func TestLoginHandler_MalformedBody(t *testing.T) {
 			t.Fatal("service should not be called when body is malformed")
 			return models.User{}, models.TokenPair{}, nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString("{bad json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -319,7 +342,7 @@ func TestLoginHandler_InvalidCredentials(t *testing.T) {
 		login: func(_ context.Context, _ models.LoginInput) (models.User, models.TokenPair, error) {
 			return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.Login), "/api/v1/auth/login", map[string]string{
 		"email": "ada@example.com", "password": "wrong",
@@ -352,7 +375,7 @@ func TestRefreshHandler_Success(t *testing.T) {
 			}
 			return user, pair, nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", nil)
 	req.AddCookie(&http.Cookie{Name: "refresh_token", Value: "old-refresh-token"})
@@ -386,7 +409,7 @@ func TestRefreshHandler_MissingCookie(t *testing.T) {
 			t.Fatal("service should not be called when cookie is missing")
 			return models.User{}, models.TokenPair{}, nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", nil)
 	rec := httptest.NewRecorder()
@@ -411,7 +434,7 @@ func TestRefreshHandler_ReuseDetected(t *testing.T) {
 		refresh: func(_ context.Context, _ string) (models.User, models.TokenPair, error) {
 			return models.User{}, models.TokenPair{}, msgs.ErrTokenReuseDetected
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", nil)
 	req.AddCookie(&http.Cookie{Name: "refresh_token", Value: "consumed-token"})
@@ -460,7 +483,7 @@ func TestLogoutHandler_Success(t *testing.T) {
 			capturedSessionID = sid
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
 	req.Header.Set("Authorization", authHeader(t, userID, sessionID))
@@ -484,7 +507,7 @@ func TestLogoutHandler_ServiceError(t *testing.T) {
 		logout: func(_ context.Context, _ uuid.UUID) error {
 			return msgs.ErrUserNotFound // any unexpected error → 500
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
 	req.Header.Set("Authorization", authHeader(t, uuid.New(), uuid.New()))
@@ -502,7 +525,7 @@ func TestLogoutHandler_MissingToken(t *testing.T) {
 			t.Fatal("service should not be called without a valid token")
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
 	rec := httptest.NewRecorder()
@@ -524,7 +547,7 @@ func TestLogoutAllHandler_Success(t *testing.T) {
 			capturedUserID = uid
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout-all", nil)
 	req.Header.Set("Authorization", authHeader(t, userID, uuid.New()))
@@ -549,7 +572,7 @@ func TestRequestEmailVerificationHandler_Success(t *testing.T) {
 			capturedEmail = email
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.RequestEmailVerification), "/api/v1/auth/email/verification/request", map[string]string{
 		"email": "ada@example.com",
@@ -579,7 +602,7 @@ func TestRequestEmailVerificationHandler_MalformedBody(t *testing.T) {
 			t.Fatal("service should not be called when body is malformed")
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/email/verification/request", bytes.NewBufferString("{bad json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -596,7 +619,7 @@ func TestRequestEmailVerificationHandler_UnknownEmailStillReturnsGenericMessage(
 		requestEmailVerification: func(_ context.Context, _ string) error {
 			return nil // service silently no-ops for unknown emails
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.RequestEmailVerification), "/api/v1/auth/email/verification/request", map[string]string{
 		"email": "unknown@example.com",
@@ -619,7 +642,7 @@ func TestVerifyEmailHandler_Success(t *testing.T) {
 			capturedToken = tok
 			return user, sub, nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.VerifyEmail), "/api/v1/auth/email/verification/verify", map[string]string{
 		"token": "raw-token",
@@ -654,7 +677,7 @@ func TestVerifyEmailHandler_TokenInvalid(t *testing.T) {
 		verifyEmail: func(_ context.Context, _ string) (models.User, models.Subscription, error) {
 			return models.User{}, models.Subscription{}, msgs.ErrTokenInvalid
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.VerifyEmail), "/api/v1/auth/email/verification/verify", map[string]string{
 		"token": "bad-token",
@@ -679,7 +702,7 @@ func TestVerifyEmailHandler_TokenAlreadyUsed(t *testing.T) {
 		verifyEmail: func(_ context.Context, _ string) (models.User, models.Subscription, error) {
 			return models.User{}, models.Subscription{}, msgs.ErrTokenAlreadyUsed
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.VerifyEmail), "/api/v1/auth/email/verification/verify", map[string]string{
 		"token": "consumed-token",
@@ -709,7 +732,7 @@ func TestRequestPasswordResetHandler_Success(t *testing.T) {
 			capturedEmail = email
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.RequestPasswordReset), "/api/v1/auth/password/reset/request", map[string]string{
 		"email": "ada@example.com",
@@ -739,7 +762,7 @@ func TestRequestPasswordResetHandler_MalformedBody(t *testing.T) {
 			t.Fatal("service should not be called when body is malformed")
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/password/reset/request", bytes.NewBufferString("{bad json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -762,7 +785,7 @@ func TestResetPasswordHandler_Success(t *testing.T) {
 			capturedNewPassword = newPassword
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.ResetPassword), "/api/v1/auth/password/reset/confirm", map[string]string{
 		"token": "raw-token", "new_password": "new-correct-battery",
@@ -785,7 +808,7 @@ func TestResetPasswordHandler_MalformedBody(t *testing.T) {
 			t.Fatal("service should not be called when body is malformed")
 			return nil
 		},
-	}})
+	}}, testHandlerCfg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/password/reset/confirm", bytes.NewBufferString("{bad json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -802,7 +825,7 @@ func TestResetPasswordHandler_TokenInvalid(t *testing.T) {
 		resetPassword: func(_ context.Context, _, _ string) error {
 			return msgs.ErrTokenInvalid
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.ResetPassword), "/api/v1/auth/password/reset/confirm", map[string]string{
 		"token": "bad-token", "new_password": "new-correct-battery",
@@ -818,7 +841,7 @@ func TestResetPasswordHandler_OAuthOnlyAccount(t *testing.T) {
 		resetPassword: func(_ context.Context, _, _ string) error {
 			return msgs.ErrPasswordNotSet
 		},
-	}})
+	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.ResetPassword), "/api/v1/auth/password/reset/confirm", map[string]string{
 		"token": "raw-token", "new_password": "new-correct-battery",
@@ -835,5 +858,171 @@ func TestResetPasswordHandler_OAuthOnlyAccount(t *testing.T) {
 	body := decodeBody[errBody](t, rec)
 	if body.Error.Code != "PASSWORD_NOT_SET" {
 		t.Errorf("expected PASSWORD_NOT_SET code, got %q", body.Error.Code)
+	}
+}
+
+// --- GoogleStart ---
+
+func TestGoogleStartHandler_Success(t *testing.T) {
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		googleAuthURL: func(_ context.Context) (string, string, error) {
+			return "https://accounts.google.com/o/oauth2/v2/auth?state=abc", "abc", nil
+		},
+	}}, testHandlerCfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/google", nil)
+	rec := httptest.NewRecorder()
+	h.GoogleStart(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+	if loc := redirectLocation(rec); loc != "https://accounts.google.com/o/oauth2/v2/auth?state=abc" {
+		t.Errorf("unexpected redirect location: %q", loc)
+	}
+	if cookieMap(rec)[oauthstate.CookieName] == "" {
+		t.Error("expected the oauth_state cookie to be set")
+	}
+}
+
+func TestGoogleStartHandler_ServiceError(t *testing.T) {
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		googleAuthURL: func(_ context.Context) (string, string, error) {
+			return "", "", errors.New("boom")
+		},
+	}}, testHandlerCfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/google", nil)
+	rec := httptest.NewRecorder()
+	h.GoogleStart(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+	if loc := redirectLocation(rec); loc != testHandlerCfg.FrontendURL+"?error=oauth_failed" {
+		t.Errorf("unexpected redirect location: %q", loc)
+	}
+}
+
+// --- GoogleCallback ---
+
+func googleCallbackRequest(t *testing.T, state, queryState string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/google/callback?code=auth-code&state="+queryState, nil)
+	if state != "" {
+		req.AddCookie(&http.Cookie{Name: oauthstate.CookieName, Value: oauthstate.Sign(testHandlerCfg.JWTSecret, state)})
+	}
+	return req
+}
+
+func TestGoogleCallbackHandler_Success(t *testing.T) {
+	user := stubUser()
+	pair := stubTokenPair()
+
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		googleCallback: func(_ context.Context, code string) (models.User, models.TokenPair, error) {
+			if code != "auth-code" {
+				t.Errorf("unexpected code: %q", code)
+			}
+			return user, pair, nil
+		},
+	}}, testHandlerCfg)
+
+	req := googleCallbackRequest(t, "state-value", "state-value")
+	rec := httptest.NewRecorder()
+	h.GoogleCallback(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+	if loc := redirectLocation(rec); loc != testHandlerCfg.FrontendURL {
+		t.Errorf("unexpected redirect location: %q", loc)
+	}
+	cookies := cookieMap(rec)
+	if cookies["access_token"] != pair.AccessToken {
+		t.Error("access_token cookie not set correctly")
+	}
+	if cookies["refresh_token"] != pair.RawRefreshToken {
+		t.Error("refresh_token cookie not set correctly")
+	}
+}
+
+func TestGoogleCallbackHandler_MissingState(t *testing.T) {
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		googleCallback: func(_ context.Context, _ string) (models.User, models.TokenPair, error) {
+			t.Fatal("service should not be called when the state cookie is missing")
+			return models.User{}, models.TokenPair{}, nil
+		},
+	}}, testHandlerCfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/google/callback?code=auth-code&state=state-value", nil)
+	rec := httptest.NewRecorder()
+	h.GoogleCallback(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+	if loc := redirectLocation(rec); loc != testHandlerCfg.FrontendURL+"?error=oauth_state_invalid" {
+		t.Errorf("unexpected redirect location: %q", loc)
+	}
+}
+
+func TestGoogleCallbackHandler_InvalidState(t *testing.T) {
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		googleCallback: func(_ context.Context, _ string) (models.User, models.TokenPair, error) {
+			t.Fatal("service should not be called when the state cookie is invalid")
+			return models.User{}, models.TokenPair{}, nil
+		},
+	}}, testHandlerCfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/google/callback?code=auth-code&state=state-value", nil)
+	req.AddCookie(&http.Cookie{Name: oauthstate.CookieName, Value: "tampered.notarealmac"})
+	rec := httptest.NewRecorder()
+	h.GoogleCallback(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+	if loc := redirectLocation(rec); loc != testHandlerCfg.FrontendURL+"?error=oauth_state_invalid" {
+		t.Errorf("unexpected redirect location: %q", loc)
+	}
+}
+
+func TestGoogleCallbackHandler_MismatchedState(t *testing.T) {
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		googleCallback: func(_ context.Context, _ string) (models.User, models.TokenPair, error) {
+			t.Fatal("service should not be called when the state doesn't match")
+			return models.User{}, models.TokenPair{}, nil
+		},
+	}}, testHandlerCfg)
+
+	req := googleCallbackRequest(t, "cookie-state", "different-query-state")
+	rec := httptest.NewRecorder()
+	h.GoogleCallback(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+	if loc := redirectLocation(rec); loc != testHandlerCfg.FrontendURL+"?error=oauth_state_invalid" {
+		t.Errorf("unexpected redirect location: %q", loc)
+	}
+}
+
+func TestGoogleCallbackHandler_ServiceError(t *testing.T) {
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		googleCallback: func(_ context.Context, _ string) (models.User, models.TokenPair, error) {
+			return models.User{}, models.TokenPair{}, errors.New("boom")
+		},
+	}}, testHandlerCfg)
+
+	req := googleCallbackRequest(t, "state-value", "state-value")
+	rec := httptest.NewRecorder()
+	h.GoogleCallback(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", rec.Code)
+	}
+	if loc := redirectLocation(rec); loc != testHandlerCfg.FrontendURL+"?error=oauth_failed" {
+		t.Errorf("unexpected redirect location: %q", loc)
 	}
 }

@@ -1,6 +1,6 @@
 # linkMe Backend — Architecture & Hard Rules
 
-> Last updated: 2026-08-14
+> Last updated: 2026-08-15
 > Applies to: the entire `linkMe` Go backend (module `linkMe`).
 
 This document is the single source of truth for **how this project is structured**
@@ -657,7 +657,7 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
+Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verification + password reset; Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
 
 ### Implemented
 
@@ -665,12 +665,16 @@ Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed ses
   composition root (repository → service → handler managers), delegates all route/middleware
   wiring to `router.SetupRoutes(h, cfg)`, listen on `:8080`.
 - **Config**: `config/config.go` — `Config{DatabaseURL, JWTSecret, AllowedOrigins []string,
-  AppEnv, ResendAPIKey, EmailFrom, FrontendURL string; RedisClient *redis.Client}`.
+  AppEnv, ResendAPIKey, EmailFrom, FrontendURL string; RedisClient *redis.Client;
+  GoogleClientID, GoogleClientSecret, GoogleRedirectURL string}`.
   `CORS_ALLOWED_ORIGINS` (comma-separated, default `http://localhost:3000`); `APP_ENV`
   (default `"development"`); `FRONTEND_URL` (default `http://localhost:3000`);
-  `REDIS_ADDR` (default `localhost:6380`). Passed to constructors via struct —
+  `REDIS_ADDR` (default `localhost:6380`); `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/
+  `GOOGLE_REDIRECT_URL` (no default — security-sensitive, must match Google's
+  console registration exactly). Passed to constructors via struct —
   never as individual args. `cmd/server/main.go` validates `DatabaseURL`,
-  `JWTSecret`, and `ResendAPIKey` are non-empty, and `Ping`s `RedisClient`, all
+  `JWTSecret`, `ResendAPIKey`, and the three Google credentials are non-empty,
+  and `Ping`s `RedisClient`, all
   at startup (`log.Fatal` otherwise) — `EmailFrom`/`FrontendURL` are not validated.
   `RedisClient` is a **deliberate, documented exception** to "Config holds only
   primitive values": session revocation (middleware), rate limiting (router),
@@ -720,13 +724,27 @@ Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed ses
   - `AuthService.VerifyEmail` — hash lookup (unknown/expired → `ErrTokenInvalid`, used → `ErrTokenAlreadyUsed`) → WithinTx(UpdateEmailVerifiedAt + MarkConsumed) → return user + active subscription (same shape as `GetMe`)
   - `AuthService.RequestPasswordReset` — normalize/validate email → silent no-op if unknown → generate opaque token (1h expiry) → store hash → `EmailService.SendPasswordResetEmail`
   - `AuthService.ResetPassword` — validate new password → hash lookup (same invalid/used checks as above) → get password identity (`ErrPasswordNotSet` if OAuth-only) → Argon2id hash → WithinTx(UpdatePasswordHash + MarkConsumed + RevokeAllSessionsForUser)
+  - `AuthService.GoogleAuthURL` — generates a CSRF state value (`utils/token.Generate`) and returns it plus `GoogleOAuthClient.AuthURL(state)`
+  - `AuthService.GoogleCallback` — exchange code → `FetchUserInfo` → reject `ErrOAuthEmailNotVerified` if unverified → existing `google` identity signs in as-is → else a matching verified email attaches a new `google` identity to that existing account (no `WithinTx`, single write) → else `WithinTx` creates a new user + `google` identity + free subscription → issue JWT + refresh token. `Register` gained a matching branch: an email match with no existing `password` identity attaches one instead of rejecting (`attachPasswordIdentity`) — the two flows are symmetric, so an account can carry both a `password` and a `google` identity (the `auth_identities` schema already allows multiple rows per `user_id`; no migration needed)
   - `UserService.GetMe` — GetUserByID + GetActiveSubscriptionByUserID
   - `UserService.ChangePassword` — validate new password → get password identity (ErrPasswordNotSet if OAuth-only) → verify current password → Argon2id hash → WithinTx(UpdatePasswordHash + RevokeOtherSessionsForUser keeping current session)
   - `EmailService` (`SendVerificationEmail`/`SendPasswordResetEmail`) — always
     Resend-backed (`emailService`); `RESEND_API_KEY` is required at startup
     (`cmd/server/main.go` fails fast if unset), no dev/noop fallback; consumed
     by `AuthService` via a constructor dependency
-    (`NewAuthService(repos, cfg, emailSvc, sessions)`).
+    (`NewAuthService(repos, cfg, emailSvc, sessions, googleClient)`).
+  - `GoogleOAuthClient` (`AuthURL`/`Exchange`/`FetchUserInfo`) — declared in
+    `internal/service` (mirrors `SessionRevoker`) so `AuthService` stays
+    decoupled/fakeable; real implementation `googleOAuthClient`
+    (`internal/service/google_oauth_client.go`) hand-rolls the two outbound
+    HTTP calls (token exchange, userinfo fetch) with stdlib `net/http` — no
+    OAuth2/OIDC dependency added. Verifies the caller's identity by calling
+    Google's userinfo endpoint with the exchanged access token rather than
+    verifying the ID token JWT locally (avoids building JWKS fetch/cache/RS256
+    verification that doesn't exist anywhere else in this codebase). One
+    consumer (`AuthService`), so per the `RedisClient` exception's own logic
+    it's constructed once in `service.NewServiceManager` from the three raw
+    `cfg.Google*` strings, not held on `Config` itself.
   - `SessionRevoker` (`RevokeSession`/`RevokeSessions`) — the write side of
     session revocation (see Middleware below for the read side). Both
     `AuthService` and `UserService` take one as a constructor dependency and
@@ -743,7 +761,8 @@ Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed ses
     constructed once in `ServiceManager.NewServiceManager` from
     `cfg.RedisClient` and passed to both services.
 - **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll/
-  RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword) + `UserHandler`
+  RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/
+  GoogleCallback) + `UserHandler`
   (GetMe/ChangePassword — renamed from `MeHandler` since it will grow to cover profile
   operations beyond `/me`). Logout/LogoutAll clear cookies via `utils/cookies.ClearTokenCookies`.
   GetMe and VerifyEmail both wrap in `{"data": <MeResponse>}` — VerifyEmail reuses the exact
@@ -754,6 +773,22 @@ Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed ses
   branch on the service's outcome. ResetPassword responds 204, consistent with
   `UserHandler.ChangePassword`. Both `UserHandler` methods read claims via
   `middleware.AuthClaims(r)`.
+  `GoogleStart`/`GoogleCallback` are the first handlers in this codebase to
+  respond with an HTTP redirect (302) rather than JSON, on both success and
+  failure — the browser reaches them via top-level navigation, not `fetch`.
+  `AuthHandler` is the first handler needing app config directly, so
+  `NewAuthHandler(service, cfg)`/`NewHandlerManager(service, cfg)` grew a
+  `config.Config` parameter (`FrontendURL` for redirect targets, `JWTSecret`
+  to sign the OAuth state cookie via the new `internal/utils/oauthstate`
+  package — `Sign`/`Verify`/`SetCookie`/`ClearCookie`, HMAC-SHA256 over a
+  `utils/token.Generate()` value, ~10min TTL cookie, unrelated to the actual
+  login session). Failures redirect to `cfg.FrontendURL` with
+  `?error=oauth_state_invalid` (bad/missing/mismatched state, caught before
+  the service is even called) or `?error=oauth_failed` (any service-layer
+  error); the underlying error is logged server-side only. No new
+  `msgs`→`codes`/`errorStatusMap` entries were added for OAuth failures since
+  these handlers never call `response.HandleError` — the one new sentinel,
+  `msgs.ErrOAuthEmailNotVerified`, exists for classification/logging only.
 - **Middleware** (`internal/middleware/`):
   - `auth.go` — `RequireAuth(jwtSecret, sessions)` (Bearer header → cookie fallback, JWT verify,
     **session-revocation check**, claims injection) + `AuthClaims(r)`. After JWT verification
@@ -784,6 +819,8 @@ Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed ses
   - `POST /api/v1/auth/register` — 5/hour rate limit
   - `POST /api/v1/auth/login` — 10/15min rate limit
   - `POST /api/v1/auth/refresh` — 60/15min rate limit
+  - `GET /api/v1/auth/google` — 10/15min rate limit, public (redirects to Google)
+  - `GET /api/v1/auth/google/callback` — 10/15min rate limit, public (redirects to `FRONTEND_URL`)
   - `POST /api/v1/auth/logout` — 10/15min rate limit + RequireAuth
   - `POST /api/v1/auth/logout-all` — 5/15min rate limit + RequireAuth
   - `GET /api/v1/me` — 60/15min rate limit + RequireAuth
@@ -796,26 +833,32 @@ Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed ses
   they "should" be protected — chosen to match the existing scheme: email-sending
   endpoints get `register`'s 5/hour, token-consuming endpoints get `login`'s 10/15min.)
 - **Tests** (under root `test/`, per §3.9/Q6):
-  - `test/service/auth_service_test.go` — Register (success/email-exists/invalid-input), Login (success/4 invalid paths), Refresh (success/reuse/expired), Logout, LogoutAll, RequestEmailVerification (success/unknown-email/already-verified), VerifyEmail (success/not-found/expired/already-used), RequestPasswordReset (success/unknown-email), ResetPassword (success/token-invalid/token-already-used/oauth-only/weak-password) — plus the shared `fakeRepo`/`fakeUserRepo`/`fakeIdentityRepo`/`fakeSessionRepo`/`fakeSubscriptionRepo`/`fakeEmailVerificationTokenRepo`/`fakePasswordResetTokenRepo`/`fakeEmailService`/`newTestAuthService` fixtures used across all service test files
+  - `test/service/auth_service_test.go` — Register (success/email-exists/invalid-input/attach-password-to-existing-google-account), Login (success/4 invalid paths), Refresh (success/reuse/expired), Logout, LogoutAll, RequestEmailVerification (success/unknown-email/already-verified), VerifyEmail (success/not-found/expired/already-used), RequestPasswordReset (success/unknown-email), ResetPassword (success/token-invalid/token-already-used/oauth-only/weak-password), GoogleAuthURL (success), GoogleCallback (existing-google-user/attach-to-existing-password-account/new-user/email-not-verified/exchange-failure/userinfo-fetch-failure) — plus the shared `fakeRepo`/`fakeUserRepo`/`fakeIdentityRepo`/`fakeSessionRepo`/`fakeSubscriptionRepo`/`fakeEmailVerificationTokenRepo`/`fakePasswordResetTokenRepo`/`fakeEmailService`/`fakeGoogleOAuthClient`/`newTestAuthService` fixtures used across all service test files
   - `test/service/user_service_test.go` — GetMe (success/not-found), ChangePassword (success/invalid-creds/oauth-only/weak-password)
   - `test/service/email_service_test.go` — SendVerificationEmail/SendPasswordResetEmail (success + non-2xx) against a fake `http.RoundTripper`, no network access
-  - `test/handlers/auth_handler_test.go` — Register/Login/Refresh/Logout/LogoutAll/RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword (happy paths + key error paths)
+  - `test/handlers/auth_handler_test.go` — Register/Login/Refresh/Logout/LogoutAll/RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/GoogleCallback (happy paths + key error paths); `redirectLocation` is the new helper for asserting `Location` headers on the two redirect-based endpoints
   - `test/handlers/user_handler_test.go` — GetMe/ChangePassword (happy paths + key error paths)
   - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer/revoked-session/revocation-check-error), AuthClaims outside protected route
   - `test/redis` — `SessionRevocationStore` (not-revoked-by-default, single/bulk revoke), `NewRateLimiter` (allow-under-limit, reject-over-limit, per-name isolation, window reset) — all against `miniredis`, no live Redis needed for the suite
   - `test/jwttoken` — Issue/Verify roundtrip, wrong key, tampered, malformed, alg:none, duration constant, distinct tokens
+  - `test/oauthstate` — Sign/Verify roundtrip, wrong secret, mismatched query state, tampered signature, malformed cookie value, SetCookie/ClearCookie attributes
   - `test/hash`, `test/token`, `test/validate`
 - **Helpers**: `pkg/dotenv`, `pkg/hash` (Argon2id PHC), `utils/token` (opaque token + SHA-256),
   `utils/validate`, `utils/response` (envelope, codes, `errorStatusMap`, `HandleError`),
-  `utils/jwttoken`, `utils/cookies` (auth cookie set/clear), `msgs` sentinel errors — no new
-  sentinels were needed for verification/reset: `ErrTokenInvalid`/`ErrTokenAlreadyUsed`/
-  `ErrPasswordNotSet`/`ErrInvalidCredentials` already covered every failure mode.
+  `utils/jwttoken`, `utils/cookies` (auth cookie set/clear), `utils/oauthstate` (signed OAuth
+  CSRF state cookie), `msgs` sentinel errors — verification/reset needed no new sentinels
+  (`ErrTokenInvalid`/`ErrTokenAlreadyUsed`/`ErrPasswordNotSet`/`ErrInvalidCredentials` already
+  covered every failure mode); Google OAuth added exactly one, `ErrOAuthEmailNotVerified`.
 
 ### Not yet implemented (from the specs)
 
-- Google OAuth / account linking
+- Google account linking/unlinking as explicit, authenticated self-service endpoints
+  (`POST /api/v1/me/auth-identities/google/link`, `DELETE /api/v1/me/auth-identities/google`,
+  auth spec §18) — login/signup (§17) is done, and it already links a `google` identity to an
+  existing account by verified-email match, but there's no way for an authenticated user to
+  add/remove a Google identity outside of that automatic path
 - Audit events (`audit_events` table exists; nothing writes to it yet — not even
-  Register/Login/the new verification/reset flows; deliberately deferred as one
+  Register/Login/the verification/reset/Google flows; deliberately deferred as one
   cross-cutting pass across all endpoints rather than partial per-endpoint coverage)
 - Account deletion, email change
 - Automatic verification email on `Register` (verification is opt-in via
@@ -825,11 +868,12 @@ Snapshot as of 2026-08-14 (email verification + password reset; Redis-backed ses
 
 ### Suggested next steps (in order of priority)
 
-1. **Google OAuth** — large feature; requires OAuth provider abstraction and new routes
-2. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
-3. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
-   existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, the new
-   verification/reset flows, …), not bolted onto one feature at a time
+1. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
+2. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
+   existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, the
+   verification/reset/Google flows, …), not bolted onto one feature at a time
+3. **Google account linking/unlinking** — the explicit self-service endpoints from §18,
+   now that login/signup (§17) has landed
 
 ---
 

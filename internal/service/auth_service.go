@@ -30,14 +30,15 @@ type authService struct {
 	cfg      config.Config
 	email    EmailService
 	sessions SessionRevoker
+	google   GoogleOAuthClient
 }
 
 // NewAuthService builds an authService backed by the given repositories,
-// application config, email service, and session revoker, embedding the
-// repository so auth flows can reach all entity repositories and WithinTx
-// directly.
-func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService, sessions SessionRevoker) *authService {
-	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions}
+// application config, email service, session revoker, and Google OAuth
+// client, embedding the repository so auth flows can reach all entity
+// repositories and WithinTx directly.
+func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService, sessions SessionRevoker, google GoogleOAuthClient) *authService {
+	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions, google: google}
 }
 
 // Register handles user registration: it normalizes and validates the input,
@@ -59,9 +60,9 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
-	_, err := s.User().GetUserByEmail(ctx, email)
+	existingUser, err := s.User().GetUserByEmail(ctx, email)
 	if err == nil {
-		return models.User{}, models.TokenPair{}, msgs.ErrEmailAlreadyExists
+		return s.attachPasswordIdentity(ctx, existingUser, input.Password)
 	}
 	if !errors.Is(err, msgs.ErrUserNotFound) {
 		return models.User{}, models.TokenPair{}, err
@@ -113,6 +114,182 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 	}
 
 	// New registrations are always on the free plan — no extra query needed.
+	pair, err := s.issueTokenPair(ctx, createdUser.ID, models.FreePlan.String())
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	return createdUser, pair, nil
+}
+
+// attachPasswordIdentity is called by Register when the requested email
+// already belongs to an existingUser. If that account already has a
+// password identity, registration is a genuine duplicate and rejected with
+// msgs.ErrEmailAlreadyExists. Otherwise the account is Google-only (per the
+// account-linking policy: Google's email is verified before such an account
+// can exist at all, so attaching by email match is safe here) and a new
+// password identity is attached to it rather than creating a second
+// account; the caller is signed in immediately. existingUser's Name/AvatarURL
+// are left untouched.
+func (s *authService) attachPasswordIdentity(ctx context.Context, existingUser models.User, password string) (models.User, models.TokenPair, error) {
+	_, err := s.AuthIdentity().GetAuthIdentityByUserIDAndProvider(ctx, existingUser.ID, "password")
+	if err == nil {
+		return models.User{}, models.TokenPair{}, msgs.ErrEmailAlreadyExists
+	}
+	if !errors.Is(err, msgs.ErrUserNotFound) {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	passwordHash, err := hash.HashPassword(password)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	_, err = s.AuthIdentity().CreateAuthIdentity(ctx, models.AuthIdentity{
+		ID:              uuid.New(),
+		UserID:          existingUser.ID,
+		Provider:        "password",
+		ProviderSubject: existingUser.Email,
+		PasswordHash:    &passwordHash,
+	})
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, existingUser.ID)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+	pair, err := s.issueTokenPair(ctx, existingUser.ID, sub.PlanID)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+	return existingUser, pair, nil
+}
+
+// GoogleAuthURL returns the URL to redirect the user to Google's consent
+// screen, plus a freshly generated CSRF state value the caller must persist
+// (e.g. in a signed cookie) and present back to GoogleCallback.
+func (s *authService) GoogleAuthURL(ctx context.Context) (string, string, error) {
+	state, err := token.Generate()
+	if err != nil {
+		return "", "", err
+	}
+	return s.google.AuthURL(state), state, nil
+}
+
+// GoogleCallback exchanges the authorization code for Google's verified
+// profile and signs the user in. An account with a matching google identity
+// signs in as-is; no google identity but a matching verified email attaches
+// a new google identity to that existing account (see attachPasswordIdentity
+// for the mirror-image case on Register); no match at all creates a new
+// user, google identity, and free-plan subscription. Returns
+// msgs.ErrOAuthEmailNotVerified if Google reports the email unverified.
+func (s *authService) GoogleCallback(ctx context.Context, code string) (models.User, models.TokenPair, error) {
+	accessToken, err := s.google.Exchange(ctx, code)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, fmt.Errorf("exchanging google authorization code: %w", err)
+	}
+
+	info, err := s.google.FetchUserInfo(ctx, accessToken)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, fmt.Errorf("fetching google user info: %w", err)
+	}
+	if !info.EmailVerified {
+		return models.User{}, models.TokenPair{}, msgs.ErrOAuthEmailNotVerified
+	}
+	email := validate.NormalizeEmail(info.Email)
+
+	identity, err := s.AuthIdentity().GetAuthIdentityByProviderAndSubject(ctx, "google", info.Subject)
+	if err == nil {
+		user, err := s.User().GetUserByID(ctx, identity.UserID)
+		if err != nil {
+			return models.User{}, models.TokenPair{}, err
+		}
+		sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, user.ID)
+		if err != nil {
+			return models.User{}, models.TokenPair{}, err
+		}
+		pair, err := s.issueTokenPair(ctx, user.ID, sub.PlanID)
+		if err != nil {
+			return models.User{}, models.TokenPair{}, err
+		}
+		return user, pair, nil
+	}
+	if !errors.Is(err, msgs.ErrUserNotFound) {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	existingUser, err := s.User().GetUserByEmail(ctx, email)
+	if err == nil {
+		_, err = s.AuthIdentity().CreateAuthIdentity(ctx, models.AuthIdentity{
+			ID:              uuid.New(),
+			UserID:          existingUser.ID,
+			Provider:        "google",
+			ProviderSubject: info.Subject,
+		})
+		if err != nil {
+			return models.User{}, models.TokenPair{}, err
+		}
+		sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, existingUser.ID)
+		if err != nil {
+			return models.User{}, models.TokenPair{}, err
+		}
+		pair, err := s.issueTokenPair(ctx, existingUser.ID, sub.PlanID)
+		if err != nil {
+			return models.User{}, models.TokenPair{}, err
+		}
+		return existingUser, pair, nil
+	}
+	if !errors.Is(err, msgs.ErrUserNotFound) {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	var createdUser models.User
+	verifiedAt := time.Now()
+	var avatarURL *string
+	if info.Picture != "" {
+		avatarURL = &info.Picture
+	}
+
+	err = s.WithinTx(ctx, func(ctx context.Context) error {
+		newUserID := uuid.New()
+
+		user, err := s.User().CreateUser(ctx, models.User{
+			ID:              newUserID,
+			Email:           email,
+			Name:            info.Name,
+			AvatarURL:       avatarURL,
+			EmailVerifiedAt: &verifiedAt,
+		})
+		if err != nil {
+			return err
+		}
+		createdUser = user
+
+		_, err = s.AuthIdentity().CreateAuthIdentity(ctx, models.AuthIdentity{
+			ID:              uuid.New(),
+			UserID:          newUserID,
+			Provider:        "google",
+			ProviderSubject: info.Subject,
+		})
+		if err != nil {
+			return err
+		}
+
+		plan := models.CreatePlan(models.FreePlan)
+		_, err = s.Subscription().CreateUserSubscription(ctx, models.Subscription{
+			ID:     uuid.New(),
+			UserID: newUserID,
+			PlanID: plan.Name,
+			Status: "active",
+		})
+		return err
+	})
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+
 	pair, err := s.issueTokenPair(ctx, createdUser.ID, models.FreePlan.String())
 	if err != nil {
 		return models.User{}, models.TokenPair{}, err

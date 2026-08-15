@@ -4,6 +4,7 @@ import (
 	"linkMe/config"
 	"linkMe/internal/redis"
 	"linkMe/internal/repository"
+	"net/http"
 
 	"github.com/resend/resend-go/v3"
 )
@@ -22,8 +23,9 @@ type ServiceManager struct {
 func NewServiceManager(repos repository.Repository, cfg config.Config) Service {
 	emailService := NewEmailService(resend.NewClient(cfg.ResendAPIKey), cfg)
 	sessionRevoker := redis.NewSessionRevocationStore(cfg.RedisClient)
+	googleClient := NewGoogleOAuthClient(http.DefaultClient, cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL)
 	return &ServiceManager{
-		authService:  NewAuthService(repos, cfg, emailService, sessionRevoker),
+		authService:  NewAuthService(repos, cfg, emailService, sessionRevoker, googleClient),
 		userService:  NewUserService(repos, sessionRevoker),
 		emailService: emailService,
 	}

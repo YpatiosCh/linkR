@@ -2,25 +2,32 @@ package handlers
 
 import (
 	"encoding/json"
+	"linkMe/config"
 	"linkMe/internal/middleware"
 	"linkMe/internal/models"
 	"linkMe/internal/service"
 	"linkMe/internal/utils/cookies"
 	"linkMe/internal/utils/jwttoken"
+	"linkMe/internal/utils/oauthstate"
 	"linkMe/internal/utils/response"
+	"log"
 	"net/http"
 	"time"
 )
 
 // authHandler implements AuthHandler by delegating to the embedded
-// service layer for all authentication operations.
+// service layer for all authentication operations. cfg supplies the
+// frontend redirect target and state-signing secret used by the Google
+// OAuth endpoints.
 type authHandler struct {
 	service.Service
+	cfg config.Config
 }
 
-// NewAuthHandler constructs an AuthHandler backed by the given service.
-func NewAuthHandler(service service.Service) AuthHandler {
-	return &authHandler{service}
+// NewAuthHandler constructs an AuthHandler backed by the given service and
+// application config.
+func NewAuthHandler(service service.Service, cfg config.Config) AuthHandler {
+	return &authHandler{service, cfg}
 }
 
 // Register handles POST /api/v1/auth/register: it decodes the JSON request body
@@ -254,4 +261,53 @@ func (h *authHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// GoogleStart handles GET /api/v1/auth/google: it asks the auth service for
+// Google's consent-screen URL and a fresh CSRF state value, signs the state
+// into a short-lived cookie, and redirects the browser to Google. Unlike
+// every other handler in this file, both this and GoogleCallback always
+// respond with a redirect, never JSON — the browser reaches these endpoints
+// via top-level navigation, not a fetch call, so a JSON error body would
+// just render as raw text. Failures are logged server-side and redirect to
+// the frontend with a generic ?error= query parameter.
+func (h *authHandler) GoogleStart(w http.ResponseWriter, r *http.Request) {
+	authURL, state, err := h.Auth().GoogleAuthURL(r.Context())
+	if err != nil {
+		log.Printf("google oauth start failed: %v", err)
+		http.Redirect(w, r, h.cfg.FrontendURL+"?error=oauth_failed", http.StatusFound)
+		return
+	}
+
+	oauthstate.SetCookie(w, oauthstate.Sign(h.cfg.JWTSecret, state))
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// GoogleCallback handles GET /api/v1/auth/google/callback: it validates the
+// signed state cookie against the query parameter, exchanges the
+// authorization code for the caller's Google identity, sets the normal auth
+// cookies on success (exactly like Login/Register), and redirects to the
+// frontend either way. A missing/invalid/mismatched state responds with
+// ?error=oauth_state_invalid without ever calling the service; any other
+// failure responds with ?error=oauth_failed.
+func (h *authHandler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
+	cookie, cookieErr := r.Cookie(oauthstate.CookieName)
+	oauthstate.ClearCookie(w)
+
+	code := r.URL.Query().Get("code")
+	queryState := r.URL.Query().Get("state")
+	if cookieErr != nil || code == "" || queryState == "" || !oauthstate.Verify(h.cfg.JWTSecret, cookie.Value, queryState) {
+		http.Redirect(w, r, h.cfg.FrontendURL+"?error=oauth_state_invalid", http.StatusFound)
+		return
+	}
+
+	_, pair, err := h.Auth().GoogleCallback(r.Context(), code)
+	if err != nil {
+		log.Printf("google oauth callback failed: %v", err)
+		http.Redirect(w, r, h.cfg.FrontendURL+"?error=oauth_failed", http.StatusFound)
+		return
+	}
+
+	cookies.SetTokenCookies(w, pair)
+	http.Redirect(w, r, h.cfg.FrontendURL, http.StatusFound)
 }

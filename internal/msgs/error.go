@@ -23,4 +23,7 @@ var (
 	ErrTokenReuseDetected = errors.New("refresh token reuse detected")
 	// ErrSubscriptionNotFound is returned when no active subscription exists for the user.
 	ErrSubscriptionNotFound = errors.New("no active subscription found")
+	// ErrOAuthEmailNotVerified is returned when a Google account's email claim
+	// is not verified; such accounts are rejected rather than trusted.
+	ErrOAuthEmailNotVerified = errors.New("google account email is not verified")
 )

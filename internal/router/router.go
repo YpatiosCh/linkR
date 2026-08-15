@@ -31,6 +31,8 @@ func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 	mux.Handle("POST /api/v1/auth/register", rl("register", 5, time.Hour)(http.HandlerFunc(h.Auth().Register)))
 	mux.Handle("POST /api/v1/auth/login", rl("login", 10, 15*time.Minute)(http.HandlerFunc(h.Auth().Login)))
 	mux.Handle("POST /api/v1/auth/refresh", rl("refresh", 60, 15*time.Minute)(http.HandlerFunc(h.Auth().Refresh)))
+	mux.Handle("GET /api/v1/auth/google", rl("google-start", 10, 15*time.Minute)(http.HandlerFunc(h.Auth().GoogleStart)))
+	mux.Handle("GET /api/v1/auth/google/callback", rl("google-callback", 10, 15*time.Minute)(http.HandlerFunc(h.Auth().GoogleCallback)))
 
 	// Authenticated auth routes.
 	mux.Handle("POST /api/v1/auth/logout", rl("logout", 10, 15*time.Minute)(requireAuth(http.HandlerFunc(h.Auth().Logout))))

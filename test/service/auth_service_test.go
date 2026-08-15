@@ -54,7 +54,35 @@ func (f *fakeRepo) PasswordResetToken() repository.PasswordResetTokenRepository 
 // session-revocation behavior are only asserted by the tests that
 // construct and inspect their own fakes.
 func newTestAuthService(repo *fakeRepo) service.AuthService {
-	return service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{})
+	return service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
+}
+
+// fakeGoogleOAuthClient is a fake service.GoogleOAuthClient with optional
+// func fields (nil defaults documented per-method), same style as every
+// other fake in this file.
+type fakeGoogleOAuthClient struct {
+	authURL       func(state string) string
+	exchange      func(ctx context.Context, code string) (string, error)
+	fetchUserInfo func(ctx context.Context, accessToken string) (service.GoogleUserInfo, error)
+}
+
+func (f *fakeGoogleOAuthClient) AuthURL(state string) string {
+	if f.authURL != nil {
+		return f.authURL(state)
+	}
+	return "https://accounts.google.com/o/oauth2/v2/auth?state=" + state
+}
+func (f *fakeGoogleOAuthClient) Exchange(ctx context.Context, code string) (string, error) {
+	if f.exchange != nil {
+		return f.exchange(ctx, code)
+	}
+	return "fake-access-token", nil
+}
+func (f *fakeGoogleOAuthClient) FetchUserInfo(ctx context.Context, accessToken string) (service.GoogleUserInfo, error) {
+	if f.fetchUserInfo != nil {
+		return f.fetchUserInfo(ctx, accessToken)
+	}
+	return service.GoogleUserInfo{}, errors.New("fetchUserInfo not configured")
 }
 
 // fakeSessionRevoker is a spy service.SessionRevoker that captures the
@@ -455,7 +483,7 @@ func TestRefreshReuseDetected(t *testing.T) {
 	sessions.revokedFamilyIDs = []uuid.UUID{revokedFamilyID}
 	revoker := &fakeSessionRevoker{}
 
-	_, _, err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).Refresh(context.Background(), "old-consumed-token")
+	_, _, err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).Refresh(context.Background(), "old-consumed-token")
 	if !errors.Is(err, msgs.ErrTokenReuseDetected) {
 		t.Fatalf("expected ErrTokenReuseDetected, got %v", err)
 	}
@@ -536,9 +564,17 @@ func TestRegisterEmailAlreadyExists(t *testing.T) {
 				return existing, nil // email is taken
 			},
 		},
-		identity: &fakeIdentityRepo{get: func(ctx context.Context, p, s string) (models.AuthIdentity, error) {
-			return models.AuthIdentity{}, msgs.ErrUserNotFound
-		}},
+		identity: &fakeIdentityRepo{
+			get: func(ctx context.Context, p, s string) (models.AuthIdentity, error) {
+				return models.AuthIdentity{}, msgs.ErrUserNotFound
+			},
+			// The existing account already has a password identity — a
+			// genuine duplicate registration, not a Google-only account to
+			// attach a password to.
+			getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
+				return passwordIdentity(t, existing.ID, "some-existing-password"), nil
+			},
+		},
 		session: &fakeSessionRepo{},
 		sub:     defaultSub(),
 	}
@@ -553,6 +589,234 @@ func TestRegisterEmailAlreadyExists(t *testing.T) {
 	}
 }
 
+func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
+	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: "Ada"}
+	identities := &fakeIdentityRepo{
+		getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
+			// The account only has a google identity — no password identity.
+			return models.AuthIdentity{}, msgs.ErrUserNotFound
+		},
+	}
+	sessions := &fakeSessionRepo{}
+	repo := &fakeRepo{
+		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return existingUser, nil
+		}},
+		identity: identities,
+		session:  sessions,
+		sub:      defaultSub(),
+	}
+
+	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
+		Email:    "ada@example.com",
+		Password: "correct-horse-battery",
+		Name:     "Ignored Name",
+	})
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if user.ID != existingUser.ID {
+		t.Errorf("expected the existing account to be reused, got a different user ID")
+	}
+	if user.Name != "Ada" {
+		t.Errorf("existing profile Name should not be overwritten, got %q", user.Name)
+	}
+	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
+		t.Error("expected both tokens to be non-empty")
+	}
+	if sessions.created != 1 {
+		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+}
+
+// --- GoogleAuthURL ---
+
+func TestGoogleAuthURL_Success(t *testing.T) {
+	repo := &fakeRepo{user: &fakeUserRepo{}, identity: &fakeIdentityRepo{}, session: &fakeSessionRepo{}, sub: defaultSub()}
+	google := &fakeGoogleOAuthClient{
+		authURL: func(state string) string {
+			return "https://accounts.google.com/o/oauth2/v2/auth?state=" + state
+		},
+	}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+
+	authURL, state, err := svc.GoogleAuthURL(context.Background())
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if state == "" {
+		t.Error("expected a non-empty state value")
+	}
+	if authURL == "" {
+		t.Error("expected a non-empty auth URL")
+	}
+}
+
+// --- GoogleCallback ---
+
+func googleInfo(subject, email string) service.GoogleUserInfo {
+	return service.GoogleUserInfo{Subject: subject, Email: email, EmailVerified: true, Name: "Ada"}
+}
+
+func TestGoogleCallback_ExistingGoogleUser(t *testing.T) {
+	userID := uuid.New()
+	identity := models.AuthIdentity{ID: uuid.New(), UserID: userID, Provider: "google", ProviderSubject: "google-sub-1"}
+	sessions := &fakeSessionRepo{}
+	repo := &fakeRepo{
+		identity: &fakeIdentityRepo{get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
+			if provider != "google" || subject != "google-sub-1" {
+				t.Fatalf("unexpected lookup: %s/%s", provider, subject)
+			}
+			return identity, nil
+		}},
+		user: &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+			return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+		}},
+		session: sessions,
+		sub:     defaultSub(),
+	}
+	google := &fakeGoogleOAuthClient{
+		fetchUserInfo: func(ctx context.Context, accessToken string) (service.GoogleUserInfo, error) {
+			return googleInfo("google-sub-1", "ada@example.com"), nil
+		},
+	}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+
+	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if user.ID != userID {
+		t.Errorf("expected user %s, got %s", userID, user.ID)
+	}
+	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
+		t.Error("expected both tokens to be non-empty")
+	}
+	if sessions.created != 1 {
+		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+}
+
+func TestGoogleCallback_AttachToExistingPasswordAccount(t *testing.T) {
+	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: "Ada"}
+	sessions := &fakeSessionRepo{}
+	identities := &fakeIdentityRepo{
+		get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
+			return models.AuthIdentity{}, msgs.ErrUserNotFound
+		},
+	}
+	repo := &fakeRepo{
+		identity: identities,
+		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return existingUser, nil
+		}},
+		session: sessions,
+		sub:     defaultSub(),
+	}
+	google := &fakeGoogleOAuthClient{
+		fetchUserInfo: func(ctx context.Context, accessToken string) (service.GoogleUserInfo, error) {
+			return googleInfo("google-sub-2", "ada@example.com"), nil
+		},
+	}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+
+	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if user.ID != existingUser.ID {
+		t.Error("expected the existing password account to be reused")
+	}
+	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
+		t.Error("expected both tokens to be non-empty")
+	}
+	if sessions.created != 1 {
+		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+}
+
+func TestGoogleCallback_NewUser(t *testing.T) {
+	sessions := &fakeSessionRepo{}
+	repo := &fakeRepo{
+		identity: &fakeIdentityRepo{get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
+			return models.AuthIdentity{}, msgs.ErrUserNotFound
+		}},
+		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return models.User{}, msgs.ErrUserNotFound
+		}},
+		session: sessions,
+		sub:     defaultSub(),
+	}
+	google := &fakeGoogleOAuthClient{
+		fetchUserInfo: func(ctx context.Context, accessToken string) (service.GoogleUserInfo, error) {
+			return googleInfo("google-sub-3", "new-google-user@example.com"), nil
+		},
+	}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+
+	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if user.Email != "new-google-user@example.com" {
+		t.Errorf("email: got %q, want %q", user.Email, "new-google-user@example.com")
+	}
+	if user.EmailVerifiedAt == nil {
+		t.Error("expected EmailVerifiedAt to be set for a Google-verified email")
+	}
+	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
+		t.Error("expected both tokens to be non-empty")
+	}
+	if sessions.created != 1 {
+		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+}
+
+func TestGoogleCallback_EmailNotVerified(t *testing.T) {
+	repo := &fakeRepo{user: &fakeUserRepo{}, identity: &fakeIdentityRepo{}, session: &fakeSessionRepo{}, sub: defaultSub()}
+	google := &fakeGoogleOAuthClient{
+		fetchUserInfo: func(ctx context.Context, accessToken string) (service.GoogleUserInfo, error) {
+			return service.GoogleUserInfo{Subject: "google-sub-4", Email: "unverified@example.com", EmailVerified: false}, nil
+		},
+	}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+
+	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
+	if !errors.Is(err, msgs.ErrOAuthEmailNotVerified) {
+		t.Fatalf("expected ErrOAuthEmailNotVerified, got %v", err)
+	}
+}
+
+func TestGoogleCallback_ExchangeFailure(t *testing.T) {
+	repo := &fakeRepo{user: &fakeUserRepo{}, identity: &fakeIdentityRepo{}, session: &fakeSessionRepo{}, sub: defaultSub()}
+	google := &fakeGoogleOAuthClient{
+		exchange: func(ctx context.Context, code string) (string, error) {
+			return "", errors.New("boom")
+		},
+	}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+
+	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
+	if err == nil {
+		t.Fatal("expected an error when the code exchange fails")
+	}
+}
+
+func TestGoogleCallback_UserInfoFetchFailure(t *testing.T) {
+	repo := &fakeRepo{user: &fakeUserRepo{}, identity: &fakeIdentityRepo{}, session: &fakeSessionRepo{}, sub: defaultSub()}
+	google := &fakeGoogleOAuthClient{
+		fetchUserInfo: func(ctx context.Context, accessToken string) (service.GoogleUserInfo, error) {
+			return service.GoogleUserInfo{}, errors.New("boom")
+		},
+	}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+
+	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
+	if err == nil {
+		t.Fatal("expected an error when the userinfo fetch fails")
+	}
+}
+
 func TestLogout(t *testing.T) {
 	sessionID := uuid.New()
 	sessions := &fakeSessionRepo{}
@@ -564,7 +828,7 @@ func TestLogout(t *testing.T) {
 	}
 	revoker := &fakeSessionRevoker{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).Logout(context.Background(), sessionID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).Logout(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -587,7 +851,7 @@ func TestLogoutAll(t *testing.T) {
 	}
 	revoker := &fakeSessionRevoker{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).LogoutAll(context.Background(), userID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).LogoutAll(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -653,7 +917,7 @@ func TestRequestEmailVerification_Success(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
 	if err := svc.RequestEmailVerification(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -679,7 +943,7 @@ func TestRequestEmailVerification_UnknownEmail(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
 	if err := svc.RequestEmailVerification(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -705,7 +969,7 @@ func TestRequestEmailVerification_AlreadyVerified(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
 	if err := svc.RequestEmailVerification(context.Background(), "ada@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -841,7 +1105,7 @@ func TestRequestPasswordReset_Success(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
 	if err := svc.RequestPasswordReset(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -867,7 +1131,7 @@ func TestRequestPasswordReset_UnknownEmail(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
 	if err := svc.RequestPasswordReset(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -910,7 +1174,7 @@ func TestResetPassword_Success(t *testing.T) {
 	}
 	revoker := &fakeSessionRevoker{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}

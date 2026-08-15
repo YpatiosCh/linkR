@@ -31,6 +31,15 @@ func main() {
 	if cfg.ResendAPIKey == "" {
 		log.Fatal("RESEND_API_KEY is not set")
 	}
+	if cfg.GoogleClientID == "" {
+		log.Fatal("GOOGLE_CLIENT_ID is not set")
+	}
+	if cfg.GoogleClientSecret == "" {
+		log.Fatal("GOOGLE_CLIENT_SECRET is not set")
+	}
+	if cfg.GoogleRedirectURL == "" {
+		log.Fatal("GOOGLE_REDIRECT_URL is not set")
+	}
 	if err := cfg.RedisClient.Ping(context.Background()).Err(); err != nil {
 		log.Fatal("unable to reach redis")
 	}
@@ -47,9 +56,9 @@ func main() {
 	}
 	log.Println("connected to database")
 
-	repos    := repository.NewRepoManager(pool)
+	repos := repository.NewRepoManager(pool)
 	services := service.NewServiceManager(repos, cfg)
-	h        := handlers.NewHandlerManager(services)
+	h := handlers.NewHandlerManager(services, cfg)
 
 	log.Println("server listening on :8080")
 	if err := http.ListenAndServe(":8080", router.SetupRoutes(h, cfg)); err != nil {
