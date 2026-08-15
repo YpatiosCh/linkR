@@ -21,25 +21,11 @@ import (
 func main() {
 	dotenv.Load()
 
-	cfg := config.Load()
-	if cfg.DatabaseURL == "" {
-		log.Fatal("DATABASE_URL is not set")
+	cfg := config.Config{}
+	if err := config.Load(&cfg); err != nil {
+		log.Fatal(err)
 	}
-	if cfg.JWTSecret == "" {
-		log.Fatal("JWT_SECRET is not set")
-	}
-	if cfg.ResendAPIKey == "" {
-		log.Fatal("RESEND_API_KEY is not set")
-	}
-	if cfg.GoogleClientID == "" {
-		log.Fatal("GOOGLE_CLIENT_ID is not set")
-	}
-	if cfg.GoogleClientSecret == "" {
-		log.Fatal("GOOGLE_CLIENT_SECRET is not set")
-	}
-	if cfg.GoogleRedirectURL == "" {
-		log.Fatal("GOOGLE_REDIRECT_URL is not set")
-	}
+
 	if err := cfg.RedisClient.Ping(context.Background()).Err(); err != nil {
 		log.Fatal("unable to reach redis")
 	}

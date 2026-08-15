@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"linkMe/internal/redis"
 	"linkMe/pkg/dotenv"
 	"strings"
@@ -39,9 +40,13 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables, falling back to the
-// .env file loaded by dotenv.Load. It does not validate — that is the
-// caller's responsibility so errors can be reported with context.
-func Load() Config {
+// .env file loaded by dotenv.Load, into config. It validates that
+// DatabaseURL, JWTSecret, ResendAPIKey, and the three Google OAuth
+// credentials are non-empty, returning an error naming the first missing
+// one; the caller (main) is responsible for reacting to that error (e.g.
+// log.Fatal). RedisClient's reachability is not checked here — that
+// requires a live network call, which the caller performs separately.
+func Load(config *Config) error {
 	originsRaw := dotenv.GetEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
 	var origins []string
 	for _, o := range strings.Split(originsRaw, ",") {
@@ -50,18 +55,36 @@ func Load() Config {
 		}
 	}
 
-	return Config{
-		DatabaseURL:    dotenv.GetEnv("DATABASE_URL", ""),
-		JWTSecret:      dotenv.GetEnv("JWT_SECRET", ""),
-		AllowedOrigins: origins,
-		AppEnv:         dotenv.GetEnv("APP_ENV", "development"),
-		ResendAPIKey:   dotenv.GetEnv("RESEND_API_KEY", ""),
-		EmailFrom:      dotenv.GetEnv("EMAIL_FROM", ""),
-		FrontendURL:    dotenv.GetEnv("FRONTEND_URL", "http://localhost:3000"),
-		RedisClient:    redis.NewClient(dotenv.GetEnv("REDIS_ADDR", "localhost:6380")),
+	config.DatabaseURL = dotenv.GetEnv("DATABASE_URL", "")
+	config.JWTSecret = dotenv.GetEnv("JWT_SECRET", "")
+	config.AllowedOrigins = origins
+	config.AppEnv = dotenv.GetEnv("APP_ENV", "development")
+	config.ResendAPIKey = dotenv.GetEnv("RESEND_API_KEY", "")
+	config.EmailFrom = dotenv.GetEnv("EMAIL_FROM", "")
+	config.FrontendURL = dotenv.GetEnv("FRONTEND_URL", "http://localhost:3000")
+	config.RedisClient = redis.NewClient(dotenv.GetEnv("REDIS_ADDR", "localhost:6380"))
+	config.GoogleClientID = dotenv.GetEnv("GOOGLE_CLIENT_ID", "")
+	config.GoogleClientSecret = dotenv.GetEnv("GOOGLE_CLIENT_SECRET", "")
+	config.GoogleRedirectURL = dotenv.GetEnv("GOOGLE_REDIRECT_URL", "")
 
-		GoogleClientID:     dotenv.GetEnv("GOOGLE_CLIENT_ID", ""),
-		GoogleClientSecret: dotenv.GetEnv("GOOGLE_CLIENT_SECRET", ""),
-		GoogleRedirectURL:  dotenv.GetEnv("GOOGLE_REDIRECT_URL", ""),
+	if config.DatabaseURL == "" {
+		return errors.New("DATABASE_URL is not set")
 	}
+	if config.JWTSecret == "" {
+		return errors.New("JWT_SECRET is not set")
+	}
+	if config.ResendAPIKey == "" {
+		return errors.New("RESEND_API_KEY is not set")
+	}
+	if config.GoogleClientID == "" {
+		return errors.New("GOOGLE_CLIENT_ID is not set")
+	}
+	if config.GoogleClientSecret == "" {
+		return errors.New("GOOGLE_CLIENT_SECRET is not set")
+	}
+	if config.GoogleRedirectURL == "" {
+		return errors.New("GOOGLE_REDIRECT_URL is not set")
+	}
+
+	return nil
 }

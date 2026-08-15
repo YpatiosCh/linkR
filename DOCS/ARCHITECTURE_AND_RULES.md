@@ -672,10 +672,14 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
   `REDIS_ADDR` (default `localhost:6380`); `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/
   `GOOGLE_REDIRECT_URL` (no default — security-sensitive, must match Google's
   console registration exactly). Passed to constructors via struct —
-  never as individual args. `cmd/server/main.go` validates `DatabaseURL`,
-  `JWTSecret`, `ResendAPIKey`, and the three Google credentials are non-empty,
-  and `Ping`s `RedisClient`, all
-  at startup (`log.Fatal` otherwise) — `EmailFrom`/`FrontendURL` are not validated.
+  never as individual args. `config.Load(cfg *Config) error` populates config
+  from the environment and validates that `DatabaseURL`, `JWTSecret`,
+  `ResendAPIKey`, and the three Google credentials are non-empty, returning
+  an error naming the first missing one — `EmailFrom`/`FrontendURL` are not
+  validated. `cmd/server/main.go` calls `Load` and `log.Fatal`s on its error,
+  then separately `Ping`s `RedisClient` (a live network call `Load` doesn't
+  perform) and `log.Fatal`s if unreachable — both checks happen at startup
+  before the server binds its listener.
   `RedisClient` is a **deliberate, documented exception** to "Config holds only
   primitive values": session revocation (middleware), rate limiting (router),
   and two services all need the *same* client, and threading it through every
