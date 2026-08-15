@@ -872,11 +872,18 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
 
 ### Suggested next steps (in order of priority)
 
-1. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
-2. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
+1. **Logging** — introduce structured, production-grade logging across the app.
+   Today logging is just scattered `log.Printf`/`log.Println` calls (`cmd/server/main.go`,
+   `internal/utils/response/handle.go`, `internal/handlers/auth_handler.go`, …) with
+   no structure, levels, or consistent fields — fine for local dev, not for anything
+   resembling real observability. This blocks/precedes the items below. Approach
+   (library, format, correlation IDs, what gets logged where) is not decided yet —
+   design it in a dedicated session, don't guess at it piecemeal per-feature.
+2. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
+3. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
    existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, the
    verification/reset/Google flows, …), not bolted onto one feature at a time
-3. **Google account linking/unlinking** — the explicit self-service endpoints from §18,
+4. **Google account linking/unlinking** — the explicit self-service endpoints from §18,
    now that login/signup (§17) has landed
 
 ---
