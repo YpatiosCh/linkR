@@ -30,3 +30,18 @@ func JSON(w http.ResponseWriter, status int, data any) {
 func Error(w http.ResponseWriter, status int, code, message string) {
 	JSON(w, status, errorEnvelope{Error: ErrorBody{Code: code, Message: message}})
 }
+
+// DecodeJSON decodes r.Body as JSON into v, rejecting any field not present
+// in v's type. On failure (malformed JSON, an unknown field, or a body that
+// exceeded a size limit set via http.MaxBytesReader upstream) it writes 400
+// INVALID_BODY and returns false; callers should return immediately when it
+// does.
+func DecodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		Error(w, http.StatusBadRequest, CodeInvalidBody, "request body is malformed")
+		return false
+	}
+	return true
+}

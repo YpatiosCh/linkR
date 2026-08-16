@@ -67,4 +67,18 @@ type UserHandler interface {
 	// current password, replaces it, and revokes all other sessions. Requires a
 	// valid access token.
 	ChangePassword(w http.ResponseWriter, r *http.Request)
+	// SetPassword handles POST /api/v1/me/password/set: sets an initial
+	// password on an account with no password identity yet (e.g. an
+	// OAuth-only account), then revokes all other sessions. Requires a
+	// valid access token.
+	SetPassword(w http.ResponseWriter, r *http.Request)
+	// UpdateProfile handles PATCH /api/v1/me/profile: applies a partial
+	// update to the authenticated user's profile (name, avatar, company
+	// name, description, social links) and returns the updated profile.
+	// Requires a valid access token.
+	UpdateProfile(w http.ResponseWriter, r *http.Request)
+	// DeleteAccount handles DELETE /api/v1/me: soft-deletes the
+	// authenticated user's account and revokes every active session.
+	// Requires a valid access token.
+	DeleteAccount(w http.ResponseWriter, r *http.Request)
 }

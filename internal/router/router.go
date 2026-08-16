@@ -11,8 +11,8 @@ import (
 
 // SetupRoutes registers all application routes on a new ServeMux, applies
 // per-route middleware (rate limiting, authentication), wraps the mux in global
-// middleware (security headers outermost, then CORS), and returns the assembled
-// handler ready to pass to http.ListenAndServe.
+// middleware (request logging outermost, then security headers, then CORS),
+// and returns the assembled handler ready to pass to http.ListenAndServe.
 func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -48,9 +48,19 @@ func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 	// Authenticated current-user routes.
 	mux.Handle("GET /api/v1/me", rl("me", 60, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().GetMe))))
 	mux.Handle("POST /api/v1/me/password/change", rl("me-password-change", 5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().ChangePassword))))
+	mux.Handle("POST /api/v1/me/password/set", rl("me-password-set", 5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().SetPassword))))
+	mux.Handle("PATCH /api/v1/me/profile", rl("me-profile-update", 20, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().UpdateProfile))))
+	mux.Handle("DELETE /api/v1/me", rl("me-delete", 5, 15*time.Minute)(requireAuth(http.HandlerFunc(h.User().DeleteAccount))))
 
-	// Global middleware: security headers run first (outermost), then CORS.
-	return middleware.SecurityHeaders(cfg.AppEnv)(
-		middleware.CORS(cfg.AllowedOrigins)(mux),
+	// Global middleware: request logging is outermost so it observes every
+	// request end-to-end (including CORS preflights and unmatched routes)
+	// and generates the request ID before anything else runs; security
+	// headers, CORS, and the request-body size cap wrap the mux as before.
+	return middleware.RequestLogger(cfg.Logger)(
+		middleware.SecurityHeaders(cfg.AppEnv)(
+			middleware.CORS(cfg.AllowedOrigins)(
+				middleware.MaxBody(middleware.MaxRequestBodyBytes)(mux),
+			),
+		),
 	)
 }

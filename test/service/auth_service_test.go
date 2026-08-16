@@ -19,6 +19,10 @@ import (
 // testCfg is the fixed application config used in all service tests.
 var testCfg = config.Config{JWTSecret: "test-secret-at-least-32-bytes-long!!"}
 
+// strPtr returns a pointer to s, for populating the optional *string fields
+// on models.User/UpdateProfileInput in test fixtures.
+func strPtr(s string) *string { return &s }
+
 // --- fake repository ---
 //
 // The auth service embeds repository.Repository, so its business logic can be
@@ -109,9 +113,17 @@ func defaultSub() *fakeSubscriptionRepo {
 }
 
 type fakeUserRepo struct {
-	getByID              func(ctx context.Context, id uuid.UUID) (models.User, error)
-	getByEmail           func(ctx context.Context, email string) (models.User, error)
-	verifiedEmailUserIDs []uuid.UUID
+	getByID                    func(ctx context.Context, id uuid.UUID) (models.User, error)
+	getByEmail                 func(ctx context.Context, email string) (models.User, error)
+	getByEmailIncludingDeleted func(ctx context.Context, email string) (models.User, error)
+	verifiedEmailUserIDs       []uuid.UUID
+	softDeletedUserIDs         []uuid.UUID
+	reactivatedUserIDs         []uuid.UUID
+	// stored simulates the persisted row UpdateProfile applies a partial
+	// update to (mirroring the real UPDATE ... COALESCE query), so tests
+	// can assert that omitted fields are left unchanged.
+	stored           models.User
+	updateProfileErr error
 }
 
 func (f *fakeUserRepo) CreateUser(ctx context.Context, u models.User) (models.User, error) {
@@ -123,21 +135,67 @@ func (f *fakeUserRepo) GetUserByEmail(ctx context.Context, email string) (models
 	}
 	return models.User{}, msgs.ErrUserNotFound
 }
+func (f *fakeUserRepo) GetUserByEmailIncludingDeleted(ctx context.Context, email string) (models.User, error) {
+	if f.getByEmailIncludingDeleted != nil {
+		return f.getByEmailIncludingDeleted(ctx, email)
+	}
+	return models.User{}, msgs.ErrUserNotFound
+}
 func (f *fakeUserRepo) GetUserByID(ctx context.Context, id uuid.UUID) (models.User, error) {
-	return f.getByID(ctx, id)
+	if f.getByID != nil {
+		return f.getByID(ctx, id)
+	}
+	// Default: the user exists and isn't deleted. Most tests only care about
+	// GetUserByID indirectly (e.g. via VerifyEmail/ResetPassword's
+	// deleted-account guard) and don't need to configure a specific user.
+	return models.User{ID: id}, nil
 }
 func (f *fakeUserRepo) UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error {
 	f.verifiedEmailUserIDs = append(f.verifiedEmailUserIDs, id)
 	return nil
+}
+func (f *fakeUserRepo) SoftDelete(ctx context.Context, id uuid.UUID) error {
+	f.softDeletedUserIDs = append(f.softDeletedUserIDs, id)
+	return nil
+}
+func (f *fakeUserRepo) Reactivate(ctx context.Context, id uuid.UUID) error {
+	f.reactivatedUserIDs = append(f.reactivatedUserIDs, id)
+	return nil
+}
+func (f *fakeUserRepo) UpdateProfile(ctx context.Context, id uuid.UUID, input models.UpdateProfileInput) (models.User, error) {
+	if f.updateProfileErr != nil {
+		return models.User{}, f.updateProfileErr
+	}
+	if input.Name != nil {
+		f.stored.Name = input.Name
+	}
+	if input.AvatarURL != nil {
+		f.stored.AvatarURL = input.AvatarURL
+	}
+	if input.CompanyName != nil {
+		f.stored.CompanyName = input.CompanyName
+	}
+	if input.Description != nil {
+		f.stored.Description = input.Description
+	}
+	if input.SocialLinks != nil {
+		f.stored.SocialLinks = *input.SocialLinks
+	}
+	f.stored.ID = id
+	return f.stored, nil
 }
 
 type fakeIdentityRepo struct {
 	get              func(ctx context.Context, provider, subject string) (models.AuthIdentity, error)
 	getByUserAndProv func(ctx context.Context, userID uuid.UUID, provider string) (models.AuthIdentity, error)
 	updatedHash      string
+	// created captures the identity passed to CreateAuthIdentity, for tests
+	// that assert on what was created (e.g. SetPassword).
+	created *models.AuthIdentity
 }
 
 func (f *fakeIdentityRepo) CreateAuthIdentity(ctx context.Context, i models.AuthIdentity) (models.AuthIdentity, error) {
+	f.created = &i
 	return i, nil
 }
 func (f *fakeIdentityRepo) GetAuthIdentityByProviderAndSubject(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
@@ -300,7 +358,7 @@ func passwordIdentity(t *testing.T, userID uuid.UUID, password string) models.Au
 
 func TestLoginSuccess(t *testing.T) {
 	userID := uuid.New()
-	identity := passwordIdentity(t, userID, "correct-horse-battery")
+	identity := passwordIdentity(t, userID, "Correct-Horse1!")
 	sessions := &fakeSessionRepo{}
 
 	repo := &fakeRepo{
@@ -320,7 +378,7 @@ func TestLoginSuccess(t *testing.T) {
 				if id != userID {
 					t.Fatalf("expected lookup for user %s, got %s", userID, id)
 				}
-				return models.User{ID: userID, Email: "user@example.com", Name: "Ada"}, nil
+				return models.User{ID: userID, Email: "user@example.com", Name: strPtr("Ada")}, nil
 			},
 		},
 		session: sessions,
@@ -332,7 +390,7 @@ func TestLoginSuccess(t *testing.T) {
 	// Mixed-case/padded email must be normalized before lookup.
 	user, pair, err := svc.Login(context.Background(), models.LoginInput{
 		Email:    "  User@Example.com ",
-		Password: "correct-horse-battery",
+		Password: "Correct-Horse1!",
 	})
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
@@ -351,6 +409,39 @@ func TestLoginSuccess(t *testing.T) {
 	}
 }
 
+func TestLoginDeletedAccount(t *testing.T) {
+	// Deletion never touches auth_identities, so the identity+password check
+	// below still succeeds for a deleted account. GetUserByID's deleted_at
+	// filter then reports ErrUserNotFound — Login must translate that into
+	// the same generic ErrInvalidCredentials every other failure uses,
+	// never leak a distinguishable error that would reveal the account used
+	// to exist.
+	userID := uuid.New()
+	identity := passwordIdentity(t, userID, "Correct-Horse1!")
+	repo := &fakeRepo{
+		identity: &fakeIdentityRepo{
+			get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
+				return identity, nil
+			},
+		},
+		user: &fakeUserRepo{
+			getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+				return models.User{}, msgs.ErrUserNotFound
+			},
+		},
+		session: &fakeSessionRepo{},
+		sub:     defaultSub(),
+	}
+
+	_, _, err := newTestAuthService(repo).Login(context.Background(), models.LoginInput{
+		Email:    "user@example.com",
+		Password: "Correct-Horse1!",
+	})
+	if !errors.Is(err, msgs.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials for a deleted account, got %v", err)
+	}
+}
+
 func TestLoginInvalidCredentials(t *testing.T) {
 	userID := uuid.New()
 
@@ -361,7 +452,7 @@ func TestLoginInvalidCredentials(t *testing.T) {
 	}{
 		{
 			name:  "malformed email",
-			input: models.LoginInput{Email: "not-an-email", Password: "correct-horse-battery"},
+			input: models.LoginInput{Email: "not-an-email", Password: "Correct-Horse1!"},
 			identity: &fakeIdentityRepo{get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
 				t.Fatal("identity lookup should not run for a malformed email")
 				return models.AuthIdentity{}, nil
@@ -369,7 +460,7 @@ func TestLoginInvalidCredentials(t *testing.T) {
 		},
 		{
 			name:  "unknown email",
-			input: models.LoginInput{Email: "user@example.com", Password: "correct-horse-battery"},
+			input: models.LoginInput{Email: "user@example.com", Password: "Correct-Horse1!"},
 			identity: &fakeIdentityRepo{get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
 				return models.AuthIdentity{}, msgs.ErrUserNotFound
 			}},
@@ -378,12 +469,12 @@ func TestLoginInvalidCredentials(t *testing.T) {
 			name:  "wrong password",
 			input: models.LoginInput{Email: "user@example.com", Password: "wrong-password"},
 			identity: &fakeIdentityRepo{get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
-				return passwordIdentity(t, userID, "correct-horse-battery"), nil
+				return passwordIdentity(t, userID, "Correct-Horse1!"), nil
 			}},
 		},
 		{
 			name:  "account without password (OAuth-only)",
-			input: models.LoginInput{Email: "user@example.com", Password: "correct-horse-battery"},
+			input: models.LoginInput{Email: "user@example.com", Password: "Correct-Horse1!"},
 			identity: &fakeIdentityRepo{get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
 				return models.AuthIdentity{ID: uuid.New(), UserID: userID, Provider: "password", ProviderSubject: "user@example.com"}, nil
 			}},
@@ -431,7 +522,7 @@ func TestRefreshSuccess(t *testing.T) {
 
 	repo := &fakeRepo{
 		user: &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
-			return models.User{ID: userID, Email: "user@example.com", Name: "Ada"}, nil
+			return models.User{ID: userID, Email: "user@example.com", Name: strPtr("Ada")}, nil
 		}},
 		identity: &fakeIdentityRepo{get: func(ctx context.Context, p, s string) (models.AuthIdentity, error) {
 			return models.AuthIdentity{}, msgs.ErrUserNotFound
@@ -533,8 +624,7 @@ func TestRegisterSuccess(t *testing.T) {
 
 	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
 		Email:    "  New@Example.com ",
-		Password: "correct-horse-battery",
-		Name:     "Ada",
+		Password: "Correct-Horse1!",
 	})
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
@@ -542,8 +632,8 @@ func TestRegisterSuccess(t *testing.T) {
 	if user.Email != "new@example.com" {
 		t.Errorf("email should be normalized, got %q", user.Email)
 	}
-	if user.Name != "Ada" {
-		t.Errorf("name: got %q, want %q", user.Name, "Ada")
+	if user.Name != nil {
+		t.Errorf("expected Name to be unset on registration, got %q", *user.Name)
 	}
 	if user.ID == (uuid.UUID{}) {
 		t.Error("user.ID should be non-zero")
@@ -557,11 +647,11 @@ func TestRegisterSuccess(t *testing.T) {
 }
 
 func TestRegisterEmailAlreadyExists(t *testing.T) {
-	existing := models.User{ID: uuid.New(), Email: "taken@example.com", Name: "Bob"}
+	existing := models.User{ID: uuid.New(), Email: "taken@example.com", Name: strPtr("Bob")}
 	repo := &fakeRepo{
 		user: &fakeUserRepo{
-			getByEmail: func(ctx context.Context, email string) (models.User, error) {
-				return existing, nil // email is taken
+			getByEmailIncludingDeleted: func(ctx context.Context, email string) (models.User, error) {
+				return existing, nil // email is taken, not deleted
 			},
 		},
 		identity: &fakeIdentityRepo{
@@ -581,8 +671,7 @@ func TestRegisterEmailAlreadyExists(t *testing.T) {
 
 	_, _, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
 		Email:    "taken@example.com",
-		Password: "correct-horse-battery",
-		Name:     "New User",
+		Password: "Correct-Horse1!",
 	})
 	if !errors.Is(err, msgs.ErrEmailAlreadyExists) {
 		t.Fatalf("expected ErrEmailAlreadyExists, got %v", err)
@@ -590,7 +679,7 @@ func TestRegisterEmailAlreadyExists(t *testing.T) {
 }
 
 func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
-	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: "Ada"}
+	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: strPtr("Ada")}
 	identities := &fakeIdentityRepo{
 		getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
 			// The account only has a google identity — no password identity.
@@ -599,7 +688,7 @@ func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
 	}
 	sessions := &fakeSessionRepo{}
 	repo := &fakeRepo{
-		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
+		user: &fakeUserRepo{getByEmailIncludingDeleted: func(ctx context.Context, email string) (models.User, error) {
 			return existingUser, nil
 		}},
 		identity: identities,
@@ -609,8 +698,7 @@ func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
 
 	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
 		Email:    "ada@example.com",
-		Password: "correct-horse-battery",
-		Name:     "Ignored Name",
+		Password: "Correct-Horse1!",
 	})
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
@@ -618,14 +706,102 @@ func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
 	if user.ID != existingUser.ID {
 		t.Errorf("expected the existing account to be reused, got a different user ID")
 	}
-	if user.Name != "Ada" {
-		t.Errorf("existing profile Name should not be overwritten, got %q", user.Name)
+	if user.Name == nil || *user.Name != "Ada" {
+		t.Errorf("existing profile Name should not be overwritten, got %v", user.Name)
 	}
 	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
 		t.Error("expected both tokens to be non-empty")
 	}
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+}
+
+func TestRegister_ReactivatesDeletedAccount_WithExistingPassword(t *testing.T) {
+	deletedAt := time.Now().Add(-24 * time.Hour)
+	userID := uuid.New()
+	deletedUser := models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada"), DeletedAt: &deletedAt}
+	identity := passwordIdentity(t, userID, "Old-Correct1!")
+	identities := &fakeIdentityRepo{
+		getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
+			return identity, nil
+		},
+	}
+	users := &fakeUserRepo{
+		getByEmailIncludingDeleted: func(ctx context.Context, email string) (models.User, error) {
+			return deletedUser, nil
+		},
+		getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+			// Reactivate cleared deleted_at, so this now succeeds like any
+			// other non-deleted lookup.
+			return models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada")}, nil
+		},
+	}
+	sessions := &fakeSessionRepo{}
+	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub()}
+
+	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
+		Email:    "ada@example.com",
+		Password: "New-Correct1!",
+	})
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if user.ID != userID {
+		t.Errorf("expected the same account ID to be reactivated, got %s", user.ID)
+	}
+	if len(users.reactivatedUserIDs) != 1 || users.reactivatedUserIDs[0] != userID {
+		t.Errorf("expected user %s to be reactivated, got %v", userID, users.reactivatedUserIDs)
+	}
+	if identities.updatedHash == "" {
+		t.Error("expected the existing password identity's hash to be updated")
+	}
+	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
+		t.Error("expected both tokens to be non-empty")
+	}
+	if sessions.created != 1 {
+		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+}
+
+func TestRegister_ReactivatesDeletedAccount_WasOAuthOnly(t *testing.T) {
+	deletedAt := time.Now().Add(-24 * time.Hour)
+	userID := uuid.New()
+	deletedUser := models.User{ID: userID, Email: "ada@example.com", DeletedAt: &deletedAt}
+	identities := &fakeIdentityRepo{
+		getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
+			return models.AuthIdentity{}, msgs.ErrUserNotFound // was Google-only before deletion
+		},
+	}
+	users := &fakeUserRepo{
+		getByEmailIncludingDeleted: func(ctx context.Context, email string) (models.User, error) {
+			return deletedUser, nil
+		},
+		getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+			return models.User{ID: userID, Email: "ada@example.com"}, nil
+		},
+	}
+	sessions := &fakeSessionRepo{}
+	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub()}
+
+	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
+		Email:    "ada@example.com",
+		Password: "New-Correct1!",
+	})
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if user.ID != userID {
+		t.Errorf("expected the same account ID to be reactivated, got %s", user.ID)
+	}
+	if identities.created == nil {
+		t.Fatal("expected a new password identity to be created")
+	}
+	if identities.created.Provider != "password" {
+		t.Errorf("Provider: got %q, want %q", identities.created.Provider, "password")
+	}
+	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
+		t.Error("expected both tokens to be non-empty")
 	}
 }
 
@@ -655,7 +831,7 @@ func TestGoogleAuthURL_Success(t *testing.T) {
 // --- GoogleCallback ---
 
 func googleInfo(subject, email string) service.GoogleUserInfo {
-	return service.GoogleUserInfo{Subject: subject, Email: email, EmailVerified: true, Name: "Ada"}
+	return service.GoogleUserInfo{Subject: subject, Email: email, EmailVerified: true, Name: "Ada", Picture: "https://example.com/ada.png"}
 }
 
 func TestGoogleCallback_ExistingGoogleUser(t *testing.T) {
@@ -670,7 +846,7 @@ func TestGoogleCallback_ExistingGoogleUser(t *testing.T) {
 			return identity, nil
 		}},
 		user: &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
-			return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+			return models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada")}, nil
 		}},
 		session: sessions,
 		sub:     defaultSub(),
@@ -698,7 +874,7 @@ func TestGoogleCallback_ExistingGoogleUser(t *testing.T) {
 }
 
 func TestGoogleCallback_AttachToExistingPasswordAccount(t *testing.T) {
-	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: "Ada"}
+	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: strPtr("Ada")}
 	sessions := &fakeSessionRepo{}
 	identities := &fakeIdentityRepo{
 		get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
@@ -763,6 +939,15 @@ func TestGoogleCallback_NewUser(t *testing.T) {
 	}
 	if user.EmailVerifiedAt == nil {
 		t.Error("expected EmailVerifiedAt to be set for a Google-verified email")
+	}
+	// Google's Name/Picture must never be seeded onto the created user —
+	// account creation (via any provider) never touches profile fields;
+	// that only happens via UserService.UpdateProfile.
+	if user.Name != nil {
+		t.Errorf("expected Name to be unset on Google signup, got %q", *user.Name)
+	}
+	if user.AvatarURL != nil {
+		t.Errorf("expected AvatarURL to be unset on Google signup, got %q", *user.AvatarURL)
 	}
 	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
 		t.Error("expected both tokens to be non-empty")
@@ -869,10 +1054,9 @@ func TestRegisterInvalidInput(t *testing.T) {
 		name  string
 		input models.RegisterInput
 	}{
-		{"invalid email", models.RegisterInput{Email: "not-an-email", Password: "correct-horse-battery", Name: "Ada"}},
-		{"empty email", models.RegisterInput{Email: "", Password: "correct-horse-battery", Name: "Ada"}},
-		{"short password", models.RegisterInput{Email: "ada@example.com", Password: "short", Name: "Ada"}},
-		{"empty name", models.RegisterInput{Email: "ada@example.com", Password: "correct-horse-battery", Name: ""}},
+		{"invalid email", models.RegisterInput{Email: "not-an-email", Password: "Correct-Horse1!"}},
+		{"empty email", models.RegisterInput{Email: "", Password: "Correct-Horse1!"}},
+		{"short password", models.RegisterInput{Email: "ada@example.com", Password: "short"}},
 	}
 
 	for _, tc := range tests {
@@ -909,7 +1093,7 @@ func TestRequestEmailVerification_Success(t *testing.T) {
 	emailSvc := &fakeEmailService{}
 	repo := &fakeRepo{
 		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
-			return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+			return models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada")}, nil
 		}},
 		identity:          &fakeIdentityRepo{},
 		session:           &fakeSessionRepo{},
@@ -996,7 +1180,7 @@ func TestVerifyEmail_Success(t *testing.T) {
 		},
 	}
 	users := &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
-		return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+		return models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada")}, nil
 	}}
 	repo := &fakeRepo{
 		user:              users,
@@ -1006,7 +1190,7 @@ func TestVerifyEmail_Success(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	user, sub, err := newTestAuthService(repo).VerifyEmail(context.Background(), "some-raw-token")
+	user, sub, hasPassword, err := newTestAuthService(repo).VerifyEmail(context.Background(), "some-raw-token")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1022,6 +1206,9 @@ func TestVerifyEmail_Success(t *testing.T) {
 	if len(tokens.consumedIDs) != 1 || tokens.consumedIDs[0] != tokenID {
 		t.Errorf("expected token %s to be consumed, got %v", tokenID, tokens.consumedIDs)
 	}
+	if hasPassword {
+		t.Error("expected hasPassword to be false (fakeIdentityRepo defaults to ErrUserNotFound)")
+	}
 }
 
 func TestVerifyEmail_NotFound(t *testing.T) {
@@ -1033,7 +1220,7 @@ func TestVerifyEmail_NotFound(t *testing.T) {
 		emailVerification: &fakeEmailVerificationTokenRepo{},
 	}
 
-	_, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "unknown-token")
+	_, _, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "unknown-token")
 	if !errors.Is(err, msgs.ErrTokenInvalid) {
 		t.Fatalf("expected ErrTokenInvalid, got %v", err)
 	}
@@ -1057,7 +1244,7 @@ func TestVerifyEmail_Expired(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	_, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "expired-token")
+	_, _, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "expired-token")
 	if !errors.Is(err, msgs.ErrTokenInvalid) {
 		t.Fatalf("expected ErrTokenInvalid for an expired token, got %v", err)
 	}
@@ -1083,9 +1270,37 @@ func TestVerifyEmail_AlreadyUsed(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	_, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "consumed-token")
+	_, _, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "consumed-token")
 	if !errors.Is(err, msgs.ErrTokenAlreadyUsed) {
 		t.Fatalf("expected ErrTokenAlreadyUsed, got %v", err)
+	}
+}
+
+func TestVerifyEmail_DeletedAccount(t *testing.T) {
+	tokens := &fakeEmailVerificationTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.EmailVerificationToken, error) {
+			return models.EmailVerificationToken{
+				ID:        uuid.New(),
+				UserID:    uuid.New(),
+				ExpiresAt: time.Now().Add(time.Hour),
+			}, nil
+		},
+	}
+	repo := &fakeRepo{
+		// getByID returns ErrUserNotFound, simulating a soft-deleted (and
+		// thus invisible) account owning this otherwise-valid token.
+		user: &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+			return models.User{}, msgs.ErrUserNotFound
+		}},
+		identity:          &fakeIdentityRepo{},
+		session:           &fakeSessionRepo{},
+		sub:               defaultSub(),
+		emailVerification: tokens,
+	}
+
+	_, _, _, err := newTestAuthService(repo).VerifyEmail(context.Background(), "some-token")
+	if !errors.Is(err, msgs.ErrTokenInvalid) {
+		t.Fatalf("expected ErrTokenInvalid for a deleted account, got %v", err)
 	}
 }
 
@@ -1097,7 +1312,7 @@ func TestRequestPasswordReset_Success(t *testing.T) {
 	emailSvc := &fakeEmailService{}
 	repo := &fakeRepo{
 		user: &fakeUserRepo{getByEmail: func(ctx context.Context, email string) (models.User, error) {
-			return models.User{ID: userID, Email: "ada@example.com", Name: "Ada"}, nil
+			return models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada")}, nil
 		}},
 		identity:      &fakeIdentityRepo{},
 		session:       &fakeSessionRepo{},
@@ -1148,7 +1363,7 @@ func TestRequestPasswordReset_UnknownEmail(t *testing.T) {
 func TestResetPassword_Success(t *testing.T) {
 	userID := uuid.New()
 	tokenID := uuid.New()
-	identity := passwordIdentity(t, userID, "old-correct-battery")
+	identity := passwordIdentity(t, userID, "Old-Correct1!")
 	tokens := &fakePasswordResetTokenRepo{
 		getByHash: func(ctx context.Context, hash string) (models.PasswordResetToken, error) {
 			return models.PasswordResetToken{
@@ -1174,7 +1389,7 @@ func TestResetPassword_Success(t *testing.T) {
 	}
 	revoker := &fakeSessionRevoker{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).ResetPassword(context.Background(), "some-raw-token", "New-Correct1!")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1201,7 +1416,7 @@ func TestResetPassword_TokenInvalid(t *testing.T) {
 		passwordReset: &fakePasswordResetTokenRepo{},
 	}
 
-	err := newTestAuthService(repo).ResetPassword(context.Background(), "unknown-token", "new-correct-battery")
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "unknown-token", "New-Correct1!")
 	if !errors.Is(err, msgs.ErrTokenInvalid) {
 		t.Fatalf("expected ErrTokenInvalid, got %v", err)
 	}
@@ -1227,7 +1442,7 @@ func TestResetPassword_TokenAlreadyUsed(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	err := newTestAuthService(repo).ResetPassword(context.Background(), "consumed-token", "new-correct-battery")
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "consumed-token", "New-Correct1!")
 	if !errors.Is(err, msgs.ErrTokenAlreadyUsed) {
 		t.Fatalf("expected ErrTokenAlreadyUsed, got %v", err)
 	}
@@ -1252,9 +1467,37 @@ func TestResetPassword_OAuthOnlyAccount(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	err := newTestAuthService(repo).ResetPassword(context.Background(), "some-raw-token", "new-correct-battery")
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "some-raw-token", "New-Correct1!")
 	if !errors.Is(err, msgs.ErrPasswordNotSet) {
 		t.Fatalf("expected ErrPasswordNotSet for OAuth-only account, got %v", err)
+	}
+}
+
+func TestResetPassword_DeletedAccount(t *testing.T) {
+	tokens := &fakePasswordResetTokenRepo{
+		getByHash: func(ctx context.Context, hash string) (models.PasswordResetToken, error) {
+			return models.PasswordResetToken{
+				ID:        uuid.New(),
+				UserID:    uuid.New(),
+				ExpiresAt: time.Now().Add(time.Hour),
+			}, nil
+		},
+	}
+	repo := &fakeRepo{
+		// getByID returns ErrUserNotFound, simulating a soft-deleted (and
+		// thus invisible) account owning this otherwise-valid token.
+		user: &fakeUserRepo{getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+			return models.User{}, msgs.ErrUserNotFound
+		}},
+		identity:      &fakeIdentityRepo{},
+		session:       &fakeSessionRepo{},
+		sub:           defaultSub(),
+		passwordReset: tokens,
+	}
+
+	err := newTestAuthService(repo).ResetPassword(context.Background(), "some-raw-token", "New-Correct1!")
+	if !errors.Is(err, msgs.ErrTokenInvalid) {
+		t.Fatalf("expected ErrTokenInvalid for a deleted account, got %v", err)
 	}
 }
 

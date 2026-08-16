@@ -24,16 +24,20 @@ type Querier interface {
 	GetPasswordResetTokenByHash(ctx context.Context, tokenHash string) (PasswordResetToken, error)
 	GetSessionByTokenHash(ctx context.Context, refreshTokenHash string) (Session, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
+	GetUserByEmailIncludingDeleted(ctx context.Context, email string) (User, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (User, error)
 	MarkEmailVerificationTokenConsumed(ctx context.Context, id uuid.UUID) error
 	MarkPasswordResetTokenConsumed(ctx context.Context, id uuid.UUID) error
 	MarkSessionConsumed(ctx context.Context, id uuid.UUID) error
+	ReactivateUser(ctx context.Context, id uuid.UUID) error
 	RevokeAllSessionsForUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
 	RevokeOtherSessionsForUser(ctx context.Context, arg RevokeOtherSessionsForUserParams) ([]uuid.UUID, error)
 	RevokeSession(ctx context.Context, id uuid.UUID) error
 	RevokeSessionFamily(ctx context.Context, tokenFamilyID uuid.UUID) ([]uuid.UUID, error)
+	SoftDeleteUser(ctx context.Context, id uuid.UUID) error
 	UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error
 	UpdatePasswordHash(ctx context.Context, arg UpdatePasswordHashParams) error
+	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error)
 }
 
 var _ Querier = (*Queries)(nil)

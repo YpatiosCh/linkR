@@ -4,6 +4,8 @@ import (
 	"errors"
 	"linkMe/internal/redis"
 	"linkMe/pkg/dotenv"
+	"linkMe/pkg/logging"
+	"log/slog"
 	"strings"
 )
 
@@ -20,15 +22,25 @@ import (
 // NOT given the same treatment — they only ever have one consumer each
 // (repository.NewRepoManager, service.NewServiceManager), so there's no
 // fan-out problem to solve for them.
+//
+// Logger follows the same reasoning as RedisClient: main (startup/shutdown
+// logging) and router.SetupRoutes (which wires it into the request-logging
+// middleware) both need the same *slog.Logger instance, so it's built once
+// here rather than threaded through constructors individually. LogLevel,
+// unlike Logger, is an ordinary primitive — like every other string on this
+// struct, it's populated in Load regardless of how many places consume it
+// (here, exactly one: the line below that builds Logger).
 type Config struct {
 	DatabaseURL    string
 	JWTSecret      string
 	AllowedOrigins []string
 	AppEnv         string
+	LogLevel       string
 	ResendAPIKey   string
 	EmailFrom      string
 	FrontendURL    string
 	RedisClient    *redis.Client
+	Logger         *slog.Logger
 
 	// Google OAuth credentials. No defaults: GoogleRedirectURL in particular
 	// must exactly match what's registered in Google's console, so silently
@@ -59,6 +71,8 @@ func Load(config *Config) error {
 	config.JWTSecret = dotenv.GetEnv("JWT_SECRET", "")
 	config.AllowedOrigins = origins
 	config.AppEnv = dotenv.GetEnv("APP_ENV", "development")
+	config.LogLevel = dotenv.GetEnv("LOG_LEVEL", "info")
+	config.Logger = logging.New(config.AppEnv, config.LogLevel)
 	config.ResendAPIKey = dotenv.GetEnv("RESEND_API_KEY", "")
 	config.EmailFrom = dotenv.GetEnv("EMAIL_FROM", "")
 	config.FrontendURL = dotenv.GetEnv("FRONTEND_URL", "http://localhost:3000")

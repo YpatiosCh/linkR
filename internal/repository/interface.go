@@ -44,6 +44,21 @@ type UserRepository interface {
 	// UpdateEmailVerifiedAt sets email_verified_at to now() on the given
 	// user, marking their email as verified.
 	UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error
+	// UpdateProfile applies a partial update to the given user's profile
+	// fields (name, avatar, company name, description, social links) and
+	// returns the updated user. A nil field in input leaves the
+	// corresponding column unchanged.
+	UpdateProfile(ctx context.Context, id uuid.UUID, input models.UpdateProfileInput) (models.User, error)
+	// GetUserByEmailIncludingDeleted returns the user with the given email
+	// regardless of deletion status, or msgs.ErrUserNotFound when no such
+	// email exists at all. Used only by Register to detect a previously
+	// soft-deleted account.
+	GetUserByEmailIncludingDeleted(ctx context.Context, email string) (models.User, error)
+	// SoftDelete sets deleted_at to now() on the given user, hiding them
+	// from every other lookup in this repository.
+	SoftDelete(ctx context.Context, id uuid.UUID) error
+	// Reactivate clears deleted_at on the given user, restoring visibility.
+	Reactivate(ctx context.Context, id uuid.UUID) error
 }
 
 // AuthIdentityRepository defines the data-access operations for auth

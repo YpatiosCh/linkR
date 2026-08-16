@@ -55,11 +55,12 @@ type AuthService interface {
 	RequestEmailVerification(ctx context.Context, email string) error
 	// VerifyEmail consumes an email verification token: it validates the
 	// token exists, is unexpired, and unused, marks the owning user's email
-	// verified, consumes the token, and returns the user plus their active
-	// subscription (the "public account representation" the auth spec
-	// requires). Returns msgs.ErrTokenInvalid for an unknown or expired
-	// token, msgs.ErrTokenAlreadyUsed for a token that was already consumed.
-	VerifyEmail(ctx context.Context, token string) (models.User, models.Subscription, error)
+	// verified, consumes the token, and returns the user, their active
+	// subscription, and whether they have a password identity (the "public
+	// account representation" the auth spec requires). Returns
+	// msgs.ErrTokenInvalid for an unknown or expired token,
+	// msgs.ErrTokenAlreadyUsed for a token that was already consumed.
+	VerifyEmail(ctx context.Context, token string) (models.User, models.Subscription, bool, error)
 	// RequestPasswordReset issues a new password reset token for the account
 	// with the given email and sends it via EmailService. It is a silent
 	// no-op — no token, no email, no error — when no account matches email,
@@ -91,14 +92,31 @@ type AuthService interface {
 // authenticated current-user resource, such as profile retrieval and
 // password changes.
 type UserService interface {
-	// GetMe returns the authenticated user and their active subscription.
-	GetMe(ctx context.Context, userID uuid.UUID) (models.User, models.Subscription, error)
+	// GetMe returns the authenticated user, their active subscription, and
+	// whether they have a password identity (false for an OAuth-only account).
+	GetMe(ctx context.Context, userID uuid.UUID) (models.User, models.Subscription, bool, error)
 	// ChangePassword verifies currentPassword against the stored Argon2id hash,
 	// replaces it with a hash of newPassword, and revokes every other active
 	// session for the user so stolen refresh tokens are immediately invalidated.
 	// Returns msgs.ErrPasswordNotSet for OAuth-only accounts, msgs.ErrInvalidCredentials
 	// if currentPassword is wrong, or a validation error if newPassword is weak.
 	ChangePassword(ctx context.Context, userID uuid.UUID, sessionID uuid.UUID, currentPassword, newPassword string) error
+	// SetPassword sets an initial password on an account with no password
+	// identity yet (e.g. an OAuth-only account), then revokes every other
+	// active session. Returns msgs.ErrPasswordAlreadySet if the account
+	// already has a password identity, or a validation error if newPassword
+	// is weak.
+	SetPassword(ctx context.Context, userID, sessionID uuid.UUID, newPassword string) error
+	// UpdateProfile applies a partial update to the authenticated user's
+	// profile (name, avatar, company name, description, social links) and
+	// returns the updated user. Nil fields in input are left unchanged;
+	// validation failures return msgs.ErrInvalidInput.
+	UpdateProfile(ctx context.Context, userID uuid.UUID, input models.UpdateProfileInput) (models.User, error)
+	// DeleteAccount soft-deletes the authenticated user's account and
+	// revokes every active session. currentPassword is required and
+	// verified only if the account has a password identity; returns
+	// msgs.ErrInvalidCredentials if it doesn't match.
+	DeleteAccount(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) error
 }
 
 // EmailService sends the transactional emails required by the authentication

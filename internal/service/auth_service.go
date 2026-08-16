@@ -41,12 +41,15 @@ func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc Ema
 	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions, google: google}
 }
 
-// Register handles user registration: it normalizes and validates the input,
-// rejects already-taken emails, hashes the password, then inside a transaction
-// creates the user, a password auth identity, and a free-plan subscription.
-// On success it issues a TokenPair and returns the created user with it;
-// failures return msgs.ErrInvalidCredentials, msgs.ErrEmailAlreadyExists, or
-// the underlying repository error.
+// Register handles user registration: it normalizes and validates the
+// email/password, rejects already-taken emails, hashes the password, then
+// inside a transaction creates the user, a password auth identity, and a
+// free-plan subscription. Registration intentionally collects only
+// email/password — the created user's Name is left unset; profile details
+// are filled in afterward via UserService.UpdateProfile. On success it
+// issues a TokenPair and returns the created user with it; failures return
+// msgs.ErrInvalidCredentials, msgs.ErrEmailAlreadyExists, or the underlying
+// repository error.
 func (s *authService) Register(ctx context.Context, input models.RegisterInput) (models.User, models.TokenPair, error) {
 	email := validate.NormalizeEmail(input.Email)
 
@@ -56,12 +59,12 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 	if !validate.Password(input.Password) {
 		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
-	if !validate.Name(input.Name) {
-		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
-	}
 
-	existingUser, err := s.User().GetUserByEmail(ctx, email)
+	existingUser, err := s.User().GetUserByEmailIncludingDeleted(ctx, email)
 	if err == nil {
+		if existingUser.DeletedAt != nil {
+			return s.reactivateAccount(ctx, existingUser, input.Password)
+		}
 		return s.attachPasswordIdentity(ctx, existingUser, input.Password)
 	}
 	if !errors.Is(err, msgs.ErrUserNotFound) {
@@ -81,7 +84,6 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 		user, err := s.User().CreateUser(ctx, models.User{
 			ID:    userID,
 			Email: email,
-			Name:  input.Name,
 		})
 		if err != nil {
 			return err
@@ -167,6 +169,63 @@ func (s *authService) attachPasswordIdentity(ctx context.Context, existingUser m
 	return existingUser, pair, nil
 }
 
+// reactivateAccount is called by Register when the requested email belongs
+// to a previously soft-deleted account (deletedUser.DeletedAt is set).
+// users.email is a permanent UNIQUE constraint — deliberately never relaxed
+// on deletion, so a deleted account's email is retained for record-keeping —
+// so a second Register with that email can never create a new account; this
+// treats it as an intentional restoration instead of a rejection: clears
+// deleted_at, sets the password identity to the newly supplied password
+// (updating it if one already existed, or creating one if the account had
+// been Google-only), and signs the caller in as the same account, same ID,
+// same history.
+func (s *authService) reactivateAccount(ctx context.Context, deletedUser models.User, password string) (models.User, models.TokenPair, error) {
+	passwordHash, err := hash.HashPassword(password)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	err = s.WithinTx(ctx, func(ctx context.Context) error {
+		if err := s.User().Reactivate(ctx, deletedUser.ID); err != nil {
+			return err
+		}
+
+		_, err := s.AuthIdentity().GetAuthIdentityByUserIDAndProvider(ctx, deletedUser.ID, "password")
+		if err == nil {
+			return s.AuthIdentity().UpdatePasswordHash(ctx, deletedUser.ID, passwordHash)
+		}
+		if !errors.Is(err, msgs.ErrUserNotFound) {
+			return err
+		}
+
+		_, err = s.AuthIdentity().CreateAuthIdentity(ctx, models.AuthIdentity{
+			ID:              uuid.New(),
+			UserID:          deletedUser.ID,
+			Provider:        "password",
+			ProviderSubject: deletedUser.Email,
+			PasswordHash:    &passwordHash,
+		})
+		return err
+	})
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+
+	reactivatedUser, err := s.User().GetUserByID(ctx, deletedUser.ID)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+	sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, deletedUser.ID)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+	pair, err := s.issueTokenPair(ctx, reactivatedUser.ID, sub.PlanID)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+	return reactivatedUser, pair, nil
+}
+
 // GoogleAuthURL returns the URL to redirect the user to Google's consent
 // screen, plus a freshly generated CSRF state value the caller must persist
 // (e.g. in a signed cookie) and present back to GoogleCallback.
@@ -247,19 +306,19 @@ func (s *authService) GoogleCallback(ctx context.Context, code string) (models.U
 
 	var createdUser models.User
 	verifiedAt := time.Now()
-	var avatarURL *string
-	if info.Picture != "" {
-		avatarURL = &info.Picture
-	}
 
 	err = s.WithinTx(ctx, func(ctx context.Context) error {
 		newUserID := uuid.New()
 
+		// Name/AvatarURL are intentionally left unset here, exactly like the
+		// password Register path — account creation never touches profile
+		// fields, regardless of provider. Google's info.Name/info.Picture
+		// are discarded rather than seeded, so there's no path by which
+		// creating an account (via any provider) can populate or override
+		// profile data; that only ever happens via UserService.UpdateProfile.
 		user, err := s.User().CreateUser(ctx, models.User{
 			ID:              newUserID,
 			Email:           email,
-			Name:            info.Name,
-			AvatarURL:       avatarURL,
 			EmailVerifiedAt: &verifiedAt,
 		})
 		if err != nil {
@@ -340,8 +399,19 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
+	// auth_identities isn't touched by account deletion (only users.deleted_at
+	// is set), so a correct password can still be verified above for a
+	// deleted account. GetUserByID's deleted_at filter then reports
+	// ErrUserNotFound — translate that to the same generic
+	// ErrInvalidCredentials as every other login failure, rather than
+	// leaking a distinguishable error that would reveal the account used to
+	// exist (breaking the enumeration defense this function otherwise
+	// maintains throughout).
 	user, err := s.User().GetUserByID(ctx, identity.UserID)
 	if err != nil {
+		if errors.Is(err, msgs.ErrUserNotFound) {
+			return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
+		}
 		return models.User{}, models.TokenPair{}, err
 	}
 
@@ -492,19 +562,26 @@ func (s *authService) RequestEmailVerification(ctx context.Context, email string
 
 // VerifyEmail consumes an email verification token: it validates the token,
 // marks the owning user's email verified, consumes the token, and returns
-// the user plus their active subscription.
-func (s *authService) VerifyEmail(ctx context.Context, rawToken string) (models.User, models.Subscription, error) {
+// the user, their active subscription, and whether they have a password
+// identity.
+func (s *authService) VerifyEmail(ctx context.Context, rawToken string) (models.User, models.Subscription, bool, error) {
 	tokenHash := token.Hash(rawToken)
 
 	t, err := s.EmailVerificationToken().GetEmailVerificationTokenByHash(ctx, tokenHash)
 	if err != nil {
-		return models.User{}, models.Subscription{}, err // msgs.ErrTokenInvalid from repo
+		return models.User{}, models.Subscription{}, false, err // msgs.ErrTokenInvalid from repo
 	}
 	if t.UsedAt != nil {
-		return models.User{}, models.Subscription{}, msgs.ErrTokenAlreadyUsed
+		return models.User{}, models.Subscription{}, false, msgs.ErrTokenAlreadyUsed
 	}
 	if time.Now().After(t.ExpiresAt) {
-		return models.User{}, models.Subscription{}, msgs.ErrTokenInvalid
+		return models.User{}, models.Subscription{}, false, msgs.ErrTokenInvalid
+	}
+	if _, err := s.User().GetUserByID(ctx, t.UserID); err != nil {
+		if errors.Is(err, msgs.ErrUserNotFound) {
+			return models.User{}, models.Subscription{}, false, msgs.ErrTokenInvalid
+		}
+		return models.User{}, models.Subscription{}, false, err
 	}
 
 	err = s.WithinTx(ctx, func(ctx context.Context) error {
@@ -514,18 +591,22 @@ func (s *authService) VerifyEmail(ctx context.Context, rawToken string) (models.
 		return s.EmailVerificationToken().MarkEmailVerificationTokenConsumed(ctx, t.ID)
 	})
 	if err != nil {
-		return models.User{}, models.Subscription{}, err
+		return models.User{}, models.Subscription{}, false, err
 	}
 
 	user, err := s.User().GetUserByID(ctx, t.UserID)
 	if err != nil {
-		return models.User{}, models.Subscription{}, err
+		return models.User{}, models.Subscription{}, false, err
 	}
 	sub, err := s.Subscription().GetActiveSubscriptionByUserID(ctx, t.UserID)
 	if err != nil {
-		return models.User{}, models.Subscription{}, err
+		return models.User{}, models.Subscription{}, false, err
 	}
-	return user, sub, nil
+	hasPassword, err := hasPasswordIdentity(ctx, s.Repository, t.UserID)
+	if err != nil {
+		return models.User{}, models.Subscription{}, false, err
+	}
+	return user, sub, hasPassword, nil
 }
 
 // RequestPasswordReset issues a new password reset token for email and
@@ -585,6 +666,12 @@ func (s *authService) ResetPassword(ctx context.Context, rawToken string, newPas
 	}
 	if time.Now().After(t.ExpiresAt) {
 		return msgs.ErrTokenInvalid
+	}
+	if _, err := s.User().GetUserByID(ctx, t.UserID); err != nil {
+		if errors.Is(err, msgs.ErrUserNotFound) {
+			return msgs.ErrTokenInvalid
+		}
+		return err
 	}
 
 	identity, err := s.AuthIdentity().GetAuthIdentityByUserIDAndProvider(ctx, t.UserID, "password")

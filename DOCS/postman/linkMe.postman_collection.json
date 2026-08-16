@@ -16,11 +16,11 @@
     },
     {
       "key": "test_password",
-      "value": "correct-horse-battery"
+      "value": "Correct-Horse1!"
     },
     {
       "key": "new_password",
-      "value": "new-correct-horse-battery"
+      "value": "New-Horse-Battery2!"
     },
     {
       "key": "access_token",
@@ -92,7 +92,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\",\n  \"name\": \"Ada Lovelace\"\n}",
+              "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -111,7 +111,7 @@
                 "register"
               ]
             },
-            "description": "201 Created. Body: {id, email, name, expires_at}. Sets access_token + refresh_token HttpOnly cookies \u2014 this request's test script reads them via pm.cookies.get(...) and stores them in the access_token/refresh_token collection variables automatically. Rate limit: 5/hour. 409 EMAIL_ALREADY_EXISTS if test_email is already registered \u2014 just Login instead."
+            "description": "201 Created. Body: {id, email, expires_at}. Registration intentionally collects ONLY email + password \u2014 no name, no profile fields; those are set afterward via PATCH /api/v1/me/profile (see the Update Profile request below). Sets access_token + refresh_token HttpOnly cookies \u2014 this request's test script reads them via pm.cookies.get(...) and stores them in the access_token/refresh_token collection variables automatically. Rate limit: 5/hour. 409 EMAIL_ALREADY_EXISTS if test_email is already registered and not deleted \u2014 just Login instead. If test_email belongs to a previously-deleted account, this instead REACTIVATES it (clears deleted_at, sets the password to whatever you send here) and signs you in \u2014 see Delete Account's description. Password must satisfy the policy: 12\u201372 bytes, at least one uppercase, one lowercase, one digit, one special character \u2014 a non-conforming password returns 401 INVALID_CREDENTIALS. An unrecognized JSON field (e.g. a stray \"name\") now returns 400 INVALID_BODY \u2014 the server rejects unknown fields instead of silently ignoring them."
           },
           "response": []
         },
@@ -160,7 +160,7 @@
                 "login"
               ]
             },
-            "description": "200 OK, same body/cookie shape as Register. 401 INVALID_CREDENTIALS covers unknown email, wrong password, and OAuth-only accounts identically (enumeration defense). Rate limit: 10/15min."
+            "description": "200 OK, same body/cookie shape as Register. 401 INVALID_CREDENTIALS covers unknown email, wrong password, a deleted account, and OAuth-only accounts identically (enumeration defense — none of these are distinguishable from the response). Rate limit: 10/15min."
           },
           "response": []
         },
@@ -335,7 +335,7 @@
                 "me"
               ]
             },
-            "description": "200 OK. Body: {data: {id, email, email_verified, name, avatar_url, plan: {id, status}}}. Requires RequireAuth. Rate limit: 60/15min."
+            "description": "200 OK. Body: {data: {id, email, email_verified, name, avatar_url, company_name, description, social_links: {platforms, other}, has_password, plan: {id, status}}}. name/avatar_url/company_name/description are omitted until set via Update Profile. has_password is never omitted (always present, true/false) — the frontend uses it to decide whether to show \"change password\" (has one) or \"set a password\" (doesn't, e.g. an OAuth-only account). Requires RequireAuth. Rate limit: 60/15min."
           },
           "response": []
         },
@@ -375,7 +375,124 @@
                 "change"
               ]
             },
-            "description": "204 No Content. Verifies current_password, hashes new_password, and revokes every OTHER active session (this one stays alive). Requires RequireAuth. Rate limit: 5/15min. After running this, either update test_password to match new_password, or use new_password directly on the next Login."
+            "description": "204 No Content. Verifies current_password, hashes new_password (must satisfy the password policy: 12–72 bytes, upper+lower+digit+special), and revokes every OTHER active session (this one stays alive). 401 PASSWORD_NOT_SET-style rejection doesn't apply here since this route requires an existing password (use Set Password instead for an OAuth-only account with none). Requires RequireAuth. Rate limit: 5/15min. After running this, either update test_password to match new_password, or use new_password directly on the next Login."
+          },
+          "response": []
+        },
+        {
+          "name": "Set Password",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_password\": \"{{new_password}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/me/password/set",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "me",
+                "password",
+                "set"
+              ]
+            },
+            "description": "204 No Content. Sets an INITIAL password on an account that doesn't have one yet (e.g. an account created via Google sign-in) — unlike Change Password, this never verifies a current password, since there isn't one. Meaningful test requires an OAuth-only account: sign in via Google: Start in a real browser (see §5 below), grab the access_token cookie it sets, and use that here instead of {{access_token}}. Revokes every OTHER active session after setting it, same safety property as Change Password. 409 PASSWORD_ALREADY_SET if the account already has a password (use Change Password instead). 401 INVALID_CREDENTIALS if new_password fails the policy. Requires RequireAuth. Rate limit: 5/15min. Run Get Me afterward — has_password flips from false to true."
+          },
+          "response": []
+        },
+        {
+          "name": "Update Profile",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Ada Lovelace\",\n  \"avatar_url\": \"https://example.com/avatar.png\",\n  \"company_name\": \"Ada's Templates\",\n  \"description\": \"I build fully searchable Notion knowledge bases.\",\n  \"social_links\": {\n    \"platforms\": {\n      \"x\": \"https://x.com/ada\",\n      \"discord\": \"https://discord.gg/ada\"\n    },\n    \"other\": [\n      { \"label\": \"Slack\", \"url\": \"https://joinslack.example/ada\" }\n    ]\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/me/profile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "me",
+                "profile"
+              ]
+            },
+            "description": "200 OK. Body: {data: <same shape as Get Me>}. PARTIAL PATCH — every field is optional; omit a field to leave it unchanged, or send an empty string/object to clear it. Delete any field you don't want to touch from the raw JSON before sending (this example sends all of them for demonstration). social_links.platforms keys must be one of: website, x, instagram, youtube, tiktok, discord, github, linkedin — an unrecognized key (e.g. a typo like \"diskord\") returns 400 INVALID_INPUT rather than being silently stored, so the frontend can always map a known key to a brand icon. social_links.other is a free-text {label, url} list for anything not in that enum (max 5 entries). All URLs must be http(s). 400 INVALID_INPUT for any validation failure (bad URL, unknown platform, too many custom links, control characters in text fields, etc). Requires RequireAuth. Rate limit: 20/15min."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Account",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"current_password\": \"{{test_password}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/me",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "me"
+              ]
+            },
+            "description": "204 No Content. DESTRUCTIVE — run this last, deliberately, not as part of a normal test pass. current_password MUST match whatever the account's password actually is right now (it may have changed if you ran Change Password or Confirm Password Reset earlier — update this field to match, or re-run Login first to confirm which password currently works). Ignored entirely for an OAuth-only account (has_password: false) — being authenticated is enough, no password needed. Soft-deletes the account (deleted_at set), revokes every session, clears cookies. 401 INVALID_CREDENTIALS if current_password doesn't match. The account and its email are NOT purged — users.email stays permanently unique, so nobody (including you) can register a brand-new account with test_email again. Instead, running Register again with test_email REACTIVATES this same account: clears deleted_at, sets the password to whatever Register was called with, and signs you in — try it right after this to see the restore flow. Requires RequireAuth. Rate limit: 5/15min."
           },
           "response": []
         }

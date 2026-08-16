@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"linkMe/config"
 	"linkMe/internal/middleware"
 	"linkMe/internal/models"
@@ -10,7 +9,6 @@ import (
 	"linkMe/internal/utils/jwttoken"
 	"linkMe/internal/utils/oauthstate"
 	"linkMe/internal/utils/response"
-	"log"
 	"net/http"
 	"time"
 )
@@ -37,18 +35,16 @@ func NewAuthHandler(service service.Service, cfg config.Config) AuthHandler {
 // maps the error to the appropriate status via response.HandleError.
 func (h *authHandler) Register(w http.ResponseWriter, r *http.Request) {
 	var req models.RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Error(w, http.StatusBadRequest, response.CodeInvalidBody, "request body is malformed")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
 	user, pair, err := h.Auth().Register(r.Context(), models.RegisterInput{
 		Email:    req.Email,
 		Password: req.Password,
-		Name:     req.Name,
 	})
 	if err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 
@@ -69,8 +65,7 @@ func (h *authHandler) Register(w http.ResponseWriter, r *http.Request) {
 // credentials become 401 INVALID_CREDENTIALS).
 func (h *authHandler) Login(w http.ResponseWriter, r *http.Request) {
 	var req models.LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Error(w, http.StatusBadRequest, response.CodeInvalidBody, "request body is malformed")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
@@ -79,7 +74,7 @@ func (h *authHandler) Login(w http.ResponseWriter, r *http.Request) {
 		Password: req.Password,
 	})
 	if err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 
@@ -107,7 +102,7 @@ func (h *authHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	_, pair, err := h.Auth().Refresh(r.Context(), cookie.Value)
 	if err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 
@@ -124,7 +119,7 @@ func (h *authHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 func (h *authHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	claims, _ := middleware.AuthClaims(r)
 	if err := h.Auth().Logout(r.Context(), claims.SessionID); err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 	cookies.ClearTokenCookies(w)
@@ -138,7 +133,7 @@ func (h *authHandler) Logout(w http.ResponseWriter, r *http.Request) {
 func (h *authHandler) LogoutAll(w http.ResponseWriter, r *http.Request) {
 	claims, _ := middleware.AuthClaims(r)
 	if err := h.Auth().LogoutAll(r.Context(), claims.UserID); err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 	cookies.ClearTokenCookies(w)
@@ -157,13 +152,12 @@ const requestEmailVerificationMessage = "If an account with that email exists an
 // response.HandleError.
 func (h *authHandler) RequestEmailVerification(w http.ResponseWriter, r *http.Request) {
 	var req models.RequestEmailVerificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Error(w, http.StatusBadRequest, response.CodeInvalidBody, "request body is malformed")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
 	if err := h.Auth().RequestEmailVerification(r.Context(), req.Email); err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 
@@ -183,32 +177,19 @@ func (h *authHandler) RequestEmailVerification(w http.ResponseWriter, r *http.Re
 // responds 401 TOKEN_ALREADY_USED.
 func (h *authHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 	var req models.VerifyEmailRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Error(w, http.StatusBadRequest, response.CodeInvalidBody, "request body is malformed")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
-	user, sub, err := h.Auth().VerifyEmail(r.Context(), req.Token)
+	user, sub, hasPassword, err := h.Auth().VerifyEmail(r.Context(), req.Token)
 	if err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 
 	response.JSON(w, http.StatusOK, struct {
 		Data models.MeResponse `json:"data"`
-	}{
-		Data: models.MeResponse{
-			ID:            user.ID.String(),
-			Email:         user.Email,
-			EmailVerified: user.EmailVerifiedAt != nil,
-			Name:          user.Name,
-			AvatarURL:     user.AvatarURL,
-			Plan: models.MePlanResponse{
-				ID:     sub.PlanID,
-				Status: sub.Status,
-			},
-		},
-	})
+	}{Data: toMeResponse(user, sub, hasPassword)})
 }
 
 // requestPasswordResetMessage is the fixed generic message returned by
@@ -223,13 +204,12 @@ const requestPasswordResetMessage = "If an account exists, a password reset emai
 // response.HandleError.
 func (h *authHandler) RequestPasswordReset(w http.ResponseWriter, r *http.Request) {
 	var req models.RequestPasswordResetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Error(w, http.StatusBadRequest, response.CodeInvalidBody, "request body is malformed")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
 	if err := h.Auth().RequestPasswordReset(r.Context(), req.Email); err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 
@@ -250,13 +230,12 @@ func (h *authHandler) RequestPasswordReset(w http.ResponseWriter, r *http.Reques
 // PASSWORD_NOT_SET.
 func (h *authHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	var req models.ResetPasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Error(w, http.StatusBadRequest, response.CodeInvalidBody, "request body is malformed")
+	if !response.DecodeJSON(w, r, &req) {
 		return
 	}
 
 	if err := h.Auth().ResetPassword(r.Context(), req.Token, req.NewPassword); err != nil {
-		response.HandleError(w, err)
+		response.HandleError(w, r, err)
 		return
 	}
 
@@ -274,7 +253,7 @@ func (h *authHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 func (h *authHandler) GoogleStart(w http.ResponseWriter, r *http.Request) {
 	authURL, state, err := h.Auth().GoogleAuthURL(r.Context())
 	if err != nil {
-		log.Printf("google oauth start failed: %v", err)
+		middleware.LoggerFromContext(r).Error("google oauth start failed", "error", err)
 		http.Redirect(w, r, h.cfg.FrontendURL+"?error=oauth_failed", http.StatusFound)
 		return
 	}
@@ -303,7 +282,7 @@ func (h *authHandler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
 
 	_, pair, err := h.Auth().GoogleCallback(r.Context(), code)
 	if err != nil {
-		log.Printf("google oauth callback failed: %v", err)
+		middleware.LoggerFromContext(r).Error("google oauth callback failed", "error", err)
 		http.Redirect(w, r, h.cfg.FrontendURL+"?error=oauth_failed", http.StatusFound)
 		return
 	}

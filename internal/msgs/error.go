@@ -26,4 +26,11 @@ var (
 	// ErrOAuthEmailNotVerified is returned when a Google account's email claim
 	// is not verified; such accounts are rejected rather than trusted.
 	ErrOAuthEmailNotVerified = errors.New("google account email is not verified")
+	// ErrInvalidInput is returned when a request's fields fail validation
+	// outside of a credentials context (e.g. profile updates) — unlike
+	// ErrInvalidCredentials, it doesn't imply anything about authentication.
+	ErrInvalidInput = errors.New("invalid input")
+	// ErrPasswordAlreadySet is returned when SetPassword is called on an
+	// account that already has a password identity — use ChangePassword instead.
+	ErrPasswordAlreadySet = errors.New("password already configured for this account")
 )

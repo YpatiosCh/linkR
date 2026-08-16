@@ -13,6 +13,8 @@ const (
 	CodeUserNotFound = "USER_NOT_FOUND"
 	// CodePasswordNotSet indicates the account has no password configured (e.g. an OAuth-only account).
 	CodePasswordNotSet = "PASSWORD_NOT_SET"
+	// CodePasswordAlreadySet indicates SetPassword was called on an account that already has a password identity.
+	CodePasswordAlreadySet = "PASSWORD_ALREADY_SET"
 	// CodeTokenInvalid indicates a token was missing, invalid, or expired.
 	CodeTokenInvalid = "TOKEN_INVALID"
 	// CodeTokenAlreadyUsed indicates a one-time token that has already been consumed.

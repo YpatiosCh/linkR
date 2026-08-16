@@ -15,13 +15,13 @@ import (
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (id, email, name, avatar_url)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at, company_name, description, social_links
 `
 
 type CreateUserParams struct {
 	ID        uuid.UUID   `json:"id"`
 	Email     string      `json:"email"`
-	Name      string      `json:"name"`
+	Name      pgtype.Text `json:"name"`
 	AvatarUrl pgtype.Text `json:"avatar_url"`
 }
 
@@ -42,12 +42,15 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.CompanyName,
+		&i.Description,
+		&i.SocialLinks,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at
+SELECT id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at, company_name, description, social_links
 FROM users
 WHERE email = $1
   AND deleted_at IS NULL
@@ -65,12 +68,40 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.CompanyName,
+		&i.Description,
+		&i.SocialLinks,
+	)
+	return i, err
+}
+
+const getUserByEmailIncludingDeleted = `-- name: GetUserByEmailIncludingDeleted :one
+SELECT id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at, company_name, description, social_links
+FROM users
+WHERE email = $1
+`
+
+func (q *Queries) GetUserByEmailIncludingDeleted(ctx context.Context, email string) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByEmailIncludingDeleted, email)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.EmailVerifiedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.CompanyName,
+		&i.Description,
+		&i.SocialLinks,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at
+SELECT id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at, company_name, description, social_links
 FROM users
 WHERE id = $1
   AND deleted_at IS NULL
@@ -88,8 +119,29 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.CompanyName,
+		&i.Description,
+		&i.SocialLinks,
 	)
 	return i, err
+}
+
+const reactivateUser = `-- name: ReactivateUser :exec
+UPDATE users SET deleted_at = NULL, updated_at = now() WHERE id = $1
+`
+
+func (q *Queries) ReactivateUser(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, reactivateUser, id)
+	return err
+}
+
+const softDeleteUser = `-- name: SoftDeleteUser :exec
+UPDATE users SET deleted_at = now(), updated_at = now() WHERE id = $1
+`
+
+func (q *Queries) SoftDeleteUser(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, softDeleteUser, id)
+	return err
 }
 
 const updateEmailVerifiedAt = `-- name: UpdateEmailVerifiedAt :exec
@@ -99,4 +151,53 @@ UPDATE users SET email_verified_at = now() WHERE id = $1
 func (q *Queries) UpdateEmailVerifiedAt(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, updateEmailVerifiedAt, id)
 	return err
+}
+
+const updateUserProfile = `-- name: UpdateUserProfile :one
+UPDATE users
+SET
+    name         = COALESCE($1, name),
+    avatar_url   = COALESCE($2, avatar_url),
+    company_name = COALESCE($3, company_name),
+    description  = COALESCE($4, description),
+    social_links = COALESCE($5, social_links),
+    updated_at   = now()
+WHERE id = $6
+  AND deleted_at IS NULL
+RETURNING id, email, name, avatar_url, email_verified_at, created_at, updated_at, deleted_at, company_name, description, social_links
+`
+
+type UpdateUserProfileParams struct {
+	Name        pgtype.Text `json:"name"`
+	AvatarUrl   pgtype.Text `json:"avatar_url"`
+	CompanyName pgtype.Text `json:"company_name"`
+	Description pgtype.Text `json:"description"`
+	SocialLinks []byte      `json:"social_links"`
+	ID          uuid.UUID   `json:"id"`
+}
+
+func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserProfile,
+		arg.Name,
+		arg.AvatarUrl,
+		arg.CompanyName,
+		arg.Description,
+		arg.SocialLinks,
+		arg.ID,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.EmailVerifiedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.CompanyName,
+		&i.Description,
+		&i.SocialLinks,
+	)
+	return i, err
 }

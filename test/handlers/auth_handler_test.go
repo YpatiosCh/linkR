@@ -36,7 +36,7 @@ type fakeAuthSvc struct {
 	logout                   func(ctx context.Context, sessionID uuid.UUID) error
 	logoutAll                func(ctx context.Context, userID uuid.UUID) error
 	requestEmailVerification func(ctx context.Context, email string) error
-	verifyEmail              func(ctx context.Context, token string) (models.User, models.Subscription, error)
+	verifyEmail              func(ctx context.Context, token string) (models.User, models.Subscription, bool, error)
 	requestPasswordReset     func(ctx context.Context, email string) error
 	resetPassword            func(ctx context.Context, token string, newPassword string) error
 	googleAuthURL            func(ctx context.Context) (string, string, error)
@@ -61,7 +61,7 @@ func (f *fakeAuthSvc) LogoutAll(ctx context.Context, userID uuid.UUID) error {
 func (f *fakeAuthSvc) RequestEmailVerification(ctx context.Context, email string) error {
 	return f.requestEmailVerification(ctx, email)
 }
-func (f *fakeAuthSvc) VerifyEmail(ctx context.Context, token string) (models.User, models.Subscription, error) {
+func (f *fakeAuthSvc) VerifyEmail(ctx context.Context, token string) (models.User, models.Subscription, bool, error) {
 	return f.verifyEmail(ctx, token)
 }
 func (f *fakeAuthSvc) RequestPasswordReset(ctx context.Context, email string) error {
@@ -80,15 +80,27 @@ func (f *fakeAuthSvc) GoogleCallback(ctx context.Context, code string) (models.U
 // fakeUserSvc is the fake service.UserService used by user-handler tests
 // (see user_handler_test.go).
 type fakeUserSvc struct {
-	getMe          func(ctx context.Context, userID uuid.UUID) (models.User, models.Subscription, error)
+	getMe          func(ctx context.Context, userID uuid.UUID) (models.User, models.Subscription, bool, error)
 	changePassword func(ctx context.Context, userID uuid.UUID, sessionID uuid.UUID, currentPassword, newPassword string) error
+	setPassword    func(ctx context.Context, userID, sessionID uuid.UUID, newPassword string) error
+	updateProfile  func(ctx context.Context, userID uuid.UUID, input models.UpdateProfileInput) (models.User, error)
+	deleteAccount  func(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) error
 }
 
-func (f *fakeUserSvc) GetMe(ctx context.Context, userID uuid.UUID) (models.User, models.Subscription, error) {
+func (f *fakeUserSvc) GetMe(ctx context.Context, userID uuid.UUID) (models.User, models.Subscription, bool, error) {
 	return f.getMe(ctx, userID)
 }
 func (f *fakeUserSvc) ChangePassword(ctx context.Context, userID uuid.UUID, sessionID uuid.UUID, currentPassword, newPassword string) error {
 	return f.changePassword(ctx, userID, sessionID, currentPassword, newPassword)
+}
+func (f *fakeUserSvc) SetPassword(ctx context.Context, userID, sessionID uuid.UUID, newPassword string) error {
+	return f.setPassword(ctx, userID, sessionID, newPassword)
+}
+func (f *fakeUserSvc) UpdateProfile(ctx context.Context, userID uuid.UUID, input models.UpdateProfileInput) (models.User, error) {
+	return f.updateProfile(ctx, userID, input)
+}
+func (f *fakeUserSvc) DeleteAccount(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) error {
+	return f.deleteAccount(ctx, userID, sessionID, currentPassword)
 }
 
 type fakeSvc struct {
@@ -122,8 +134,12 @@ func stubTokenPair() models.TokenPair {
 
 // stubUser returns a minimal user for handler-level tests.
 func stubUser() models.User {
-	return models.User{ID: uuid.New(), Email: "ada@example.com", Name: "Ada"}
+	return models.User{ID: uuid.New(), Email: "ada@example.com", Name: strPtr("Ada")}
 }
+
+// strPtr returns a pointer to s, for populating the optional *string fields
+// on models.User/UpdateProfileInput in test fixtures.
+func strPtr(s string) *string { return &s }
 
 // --- helpers ---
 
@@ -192,7 +208,7 @@ func TestRegisterHandler_Success(t *testing.T) {
 	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.Register), "/api/v1/auth/register", map[string]string{
-		"email": "ada@example.com", "password": "correct-horse-battery", "name": "Ada",
+		"email": "ada@example.com", "password": "Correct-Horse1!",
 	})
 
 	if rec.Code != http.StatusCreated {
@@ -202,15 +218,18 @@ func TestRegisterHandler_Success(t *testing.T) {
 	type authBody struct {
 		ID        string    `json:"id"`
 		Email     string    `json:"email"`
-		Name      string    `json:"name"`
+		Name      *string   `json:"name,omitempty"`
 		ExpiresAt time.Time `json:"expires_at"`
 	}
 	body := decodeBody[authBody](t, rec)
 	if body.Email != user.Email {
 		t.Errorf("email: got %q, want %q", body.Email, user.Email)
 	}
-	if body.Name != user.Name {
-		t.Errorf("name: got %q, want %q", body.Name, user.Name)
+	// The service is faked to return stubUser(), which has Name set —
+	// Register itself no longer sends/collects a name, but it still
+	// faithfully reflects whatever the service returns.
+	if body.Name == nil || user.Name == nil || *body.Name != *user.Name {
+		t.Errorf("name: got %v, want %v", body.Name, user.Name)
 	}
 	if body.ExpiresAt.IsZero() {
 		t.Error("expected non-zero expires_at in register response")
@@ -252,6 +271,32 @@ func TestRegisterHandler_MalformedBody(t *testing.T) {
 	}
 }
 
+func TestRegisterHandler_UnknownFieldRejected(t *testing.T) {
+	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
+		register: func(_ context.Context, _ models.RegisterInput) (models.User, models.TokenPair, error) {
+			t.Fatal("service should not be called when the body has an unknown field")
+			return models.User{}, models.TokenPair{}, nil
+		},
+	}}, testHandlerCfg)
+
+	rec := postJSON(t, http.HandlerFunc(h.Register), "/api/v1/auth/register", map[string]string{
+		"email": "ada@example.com", "password": "Correct-Horse1!", "nam": "typo",
+	})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for an unknown field, got %d", rec.Code)
+	}
+	type errBody struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	body := decodeBody[errBody](t, rec)
+	if body.Error.Code != "INVALID_BODY" {
+		t.Errorf("expected INVALID_BODY code, got %q", body.Error.Code)
+	}
+}
+
 func TestRegisterHandler_EmailAlreadyExists(t *testing.T) {
 	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
 		register: func(_ context.Context, _ models.RegisterInput) (models.User, models.TokenPair, error) {
@@ -260,7 +305,7 @@ func TestRegisterHandler_EmailAlreadyExists(t *testing.T) {
 	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.Register), "/api/v1/auth/register", map[string]string{
-		"email": "taken@example.com", "password": "correct-horse-battery", "name": "Ada",
+		"email": "taken@example.com", "password": "Correct-Horse1!",
 	})
 
 	if rec.Code != http.StatusConflict {
@@ -290,7 +335,7 @@ func TestLoginHandler_Success(t *testing.T) {
 	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.Login), "/api/v1/auth/login", map[string]string{
-		"email": "ada@example.com", "password": "correct-horse-battery",
+		"email": "ada@example.com", "password": "Correct-Horse1!",
 	})
 
 	if rec.Code != http.StatusOK {
@@ -633,14 +678,14 @@ func TestRequestEmailVerificationHandler_UnknownEmailStillReturnsGenericMessage(
 // --- VerifyEmail ---
 
 func TestVerifyEmailHandler_Success(t *testing.T) {
-	user := models.User{ID: uuid.New(), Email: "ada@example.com", Name: "Ada"}
+	user := models.User{ID: uuid.New(), Email: "ada@example.com", Name: strPtr("Ada")}
 	sub := models.Subscription{PlanID: "free", Status: "active"}
 	var capturedToken string
 
 	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
-		verifyEmail: func(_ context.Context, tok string) (models.User, models.Subscription, error) {
+		verifyEmail: func(_ context.Context, tok string) (models.User, models.Subscription, bool, error) {
 			capturedToken = tok
-			return user, sub, nil
+			return user, sub, true, nil
 		},
 	}}, testHandlerCfg)
 
@@ -674,8 +719,8 @@ func TestVerifyEmailHandler_Success(t *testing.T) {
 
 func TestVerifyEmailHandler_TokenInvalid(t *testing.T) {
 	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
-		verifyEmail: func(_ context.Context, _ string) (models.User, models.Subscription, error) {
-			return models.User{}, models.Subscription{}, msgs.ErrTokenInvalid
+		verifyEmail: func(_ context.Context, _ string) (models.User, models.Subscription, bool, error) {
+			return models.User{}, models.Subscription{}, false, msgs.ErrTokenInvalid
 		},
 	}}, testHandlerCfg)
 
@@ -699,8 +744,8 @@ func TestVerifyEmailHandler_TokenInvalid(t *testing.T) {
 
 func TestVerifyEmailHandler_TokenAlreadyUsed(t *testing.T) {
 	h := handlers.NewAuthHandler(&fakeSvc{auth: &fakeAuthSvc{
-		verifyEmail: func(_ context.Context, _ string) (models.User, models.Subscription, error) {
-			return models.User{}, models.Subscription{}, msgs.ErrTokenAlreadyUsed
+		verifyEmail: func(_ context.Context, _ string) (models.User, models.Subscription, bool, error) {
+			return models.User{}, models.Subscription{}, false, msgs.ErrTokenAlreadyUsed
 		},
 	}}, testHandlerCfg)
 
@@ -788,7 +833,7 @@ func TestResetPasswordHandler_Success(t *testing.T) {
 	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.ResetPassword), "/api/v1/auth/password/reset/confirm", map[string]string{
-		"token": "raw-token", "new_password": "new-correct-battery",
+		"token": "raw-token", "new_password": "New-Correct1!",
 	})
 
 	if rec.Code != http.StatusNoContent {
@@ -797,8 +842,8 @@ func TestResetPasswordHandler_Success(t *testing.T) {
 	if capturedToken != "raw-token" {
 		t.Errorf("token: got %q, want %q", capturedToken, "raw-token")
 	}
-	if capturedNewPassword != "new-correct-battery" {
-		t.Errorf("newPassword: got %q, want %q", capturedNewPassword, "new-correct-battery")
+	if capturedNewPassword != "New-Correct1!" {
+		t.Errorf("newPassword: got %q, want %q", capturedNewPassword, "New-Correct1!")
 	}
 }
 
@@ -828,7 +873,7 @@ func TestResetPasswordHandler_TokenInvalid(t *testing.T) {
 	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.ResetPassword), "/api/v1/auth/password/reset/confirm", map[string]string{
-		"token": "bad-token", "new_password": "new-correct-battery",
+		"token": "bad-token", "new_password": "New-Correct1!",
 	})
 
 	if rec.Code != http.StatusUnauthorized {
@@ -844,7 +889,7 @@ func TestResetPasswordHandler_OAuthOnlyAccount(t *testing.T) {
 	}}, testHandlerCfg)
 
 	rec := postJSON(t, http.HandlerFunc(h.ResetPassword), "/api/v1/auth/password/reset/confirm", map[string]string{
-		"token": "raw-token", "new_password": "new-correct-battery",
+		"token": "raw-token", "new_password": "New-Correct1!",
 	})
 
 	if rec.Code != http.StatusBadRequest {

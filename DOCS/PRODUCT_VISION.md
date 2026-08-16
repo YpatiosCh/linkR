@@ -263,6 +263,20 @@ don't have to relitigate them:
   Corrected the pricing statement (Free = $0, Pro = $19; earlier "$19–$49 Free/Pro"
   was wrong per the plans spec). Added explicit buyer-side section (§8) and
   guardrails (§10). Flagged fee-resolution-from-token as a security decision (§5.2).
+- (2026-08-16) Considered, deferred: new-device/new-location login alert emails
+  (triggered on `Login`/`GoogleCallback` when the session's IP/User-Agent hasn't
+  been seen before for that user), with a call-to-action that differs by account
+  type — password accounts get a "reset your password" link (which already
+  revokes every other session in one action); OAuth-only accounts get a
+  "set a password" + "log out everywhere" link, since they have no password to
+  rotate and stolen-email account takeover for an OAuth-only account is really a
+  compromised-Google-account problem outside this app's control. Deferred because
+  a naive "seen this (IP, User-Agent) pair before" check would false-positive
+  constantly for mobile/VPN/rotating-IP users — needs real design (device
+  fingerprinting, ASN/geo-tolerant IP comparison, or an accepted-false-positive
+  approach) before implementation, not a bolted-on heuristic. The
+  `POST /api/v1/me/password/set` endpoint (added in the same pass that logged
+  this idea) is exactly what the OAuth-only side of that future CTA would use.
 
 ---
 

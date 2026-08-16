@@ -1,6 +1,6 @@
 # linkMe Backend — Architecture & Hard Rules
 
-> Last updated: 2026-08-15
+> Last updated: 2026-08-16
 > Applies to: the entire `linkMe` Go backend (module `linkMe`).
 
 This document is the single source of truth for **how this project is structured**
@@ -553,6 +553,64 @@ that conflicts with a rule, raise the conflict instead of silently breaking it.
 - **F3 — Commit only when asked.** Never commit, push, or open PRs unprompted.
 - **F4 — Don't implement beyond the request.** No gold-plating, no "while I'm
   here" refactors, no implementing future spec sections not asked for.
+- **F5 — Every new or changed route ships with its Postman documentation.**
+  `DOCS/postman/linkMe.postman_collection.json` and `internal/router/router.go`
+  must stay in exact 1:1 sync — the set of (method, path) pairs in the
+  collection must equal the set wired in `SetupRoutes`, no more, no less
+  (verify with a quick diff of the two lists before declaring a route-adding
+  task done, the way it was verified when this rule was written). For every
+  new route:
+  1. Add a request to the collection, in the right folder, with a real
+     example body/headers and the correct rate limit noted.
+  2. Write its `description` field to cover every status code and error
+     code it can return, not just the happy path — mirror the density of
+     detail already in the collection's existing requests.
+  3. Update `DOCS/postman.md`: add or extend a walkthrough section
+     explaining what the route does, how to exercise it manually, and any
+     ordering dependency on other requests (e.g. "run Login first").
+  4. Add at least 2–3 QA testing combinations to `postman.md` for that
+     route — the happy path plus the meaningful failure modes (invalid
+     input, wrong auth state, the specific sentinel errors it can return) —
+     not just "it returns 200."
+  A route is not done until both files reflect it, in the same PR/session
+  that adds it — not as a follow-up.
+
+### 7.9 Observability
+
+- **O1 — Log at the edges, using the existing pipeline, not ad-hoc calls.**
+  This codebase has a real structured-logging pipeline
+  (`pkg/logging` + `internal/utils/logctx` + `internal/middleware/requestlog.go`
+  — see §9's Logging entry for the full design). New code must use it, not
+  `fmt.Println`/`log.Printf`/a fresh ad-hoc logger. In practice, most new
+  request-handling code needs **zero** additional logging calls:
+  - `middleware.RequestLogger` already logs one structured access-log line
+    (method/path/status/duration_ms/request_id) for every request, automatically.
+  - `response.HandleError` already logs every sentinel-mapped error (`Warn`
+    for a 4xx, `Error` for a 500-mapped sentinel) and every unmapped error
+    (`Error`) exactly once, automatically, whenever a handler calls it. A new
+    endpoint that reports failures through `response.HandleError` (the
+    default — see Rule D1/H1) gets this for free.
+  Only add an explicit log call when:
+  1. A handler responds through a mechanism *other than* `response.HandleError`
+     and still needs failure visibility — e.g. a redirect-based handler like
+     `GoogleStart`/`GoogleCallback`. Use `middleware.LoggerFromContext(r)` (or
+     `logctx.FromContext(ctx)` from a context without direct `*http.Request`
+     access) so the log line still carries the request's correlation ID.
+  2. A lifecycle event happens outside a request entirely — startup,
+     shutdown, a future background job. Use `cfg.Logger` directly, the same
+     way `cmd/server/main.go` does.
+  **Never add logging calls inside `internal/service` or `internal/repository`.**
+  Errors already propagate as sentinels up to the HTTP boundary and get
+  logged exactly once there; a logger call inside a service/repository method
+  produces a second, duplicate log line for the same failure and violates
+  Rule D3 ("log where a failure is handled, not everywhere"). If a new
+  service-layer error needs a status/log-level mapping it doesn't have yet,
+  add the sentinel to `msgs` and map it in `errorStatusMap` (Rule D1) rather
+  than logging it manually at the point it's returned.
+  Never log secrets, passwords, raw tokens, or full request bodies/query
+  strings (Rule S2) — the existing access-log fields (method/path/status/
+  duration) are deliberately narrow for this reason; don't widen them to
+  include headers, cookies, or the query string without a specific reason.
 
 ---
 
@@ -643,12 +701,21 @@ h := handlers.NewHandlerManager(services)
 log.Fatal(http.ListenAndServe(":8080", router.SetupRoutes(h, cfg)))
 ```
 
-### Step 7 — Tests + verification (Q1, Q2)
+### Step 7 — Document in Postman (F5)
+
+Add the route to `DOCS/postman/linkMe.postman_collection.json` (real example
+body, correct rate limit, a `description` covering every status/error code it
+can return) and to `DOCS/postman.md` (a walkthrough section: what it does,
+how to exercise it, any ordering dependency on other requests, plus 2–3 QA
+combinations — happy path and the meaningful failure modes). Don't defer this
+to a follow-up — it's part of the route being done.
+
+### Step 8 — Tests + verification (Q1, Q2)
 
 - Write the tests the spec mandates (plans spec §29–30 defines the strategy).
 - Run `gofmt`, `go vet ./...`, `go build ./...`, and the test suite.
 
-### Step 8 — Ask when in doubt (G1)
+### Step 9 — Ask when in doubt (G1)
 
 Anything ambiguous at any step — DTO shapes, status codes, transaction
 boundaries, spec vs. code conflicts — stop and ask before proceeding.
@@ -657,7 +724,7 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verification + password reset; Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
+Snapshot as of 2026-08-16 (account deletion + reactivation, on top of: structured logging pipeline; two-phase registration + seller profile system; password/input validation hardening + self-service `SetPassword`; Google OAuth login/signup + email verification + password reset + Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
 
 ### Implemented
 
@@ -665,52 +732,91 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
   composition root (repository → service → handler managers), delegates all route/middleware
   wiring to `router.SetupRoutes(h, cfg)`, listen on `:8080`.
 - **Config**: `config/config.go` — `Config{DatabaseURL, JWTSecret, AllowedOrigins []string,
-  AppEnv, ResendAPIKey, EmailFrom, FrontendURL string; RedisClient *redis.Client;
-  GoogleClientID, GoogleClientSecret, GoogleRedirectURL string}`.
+  AppEnv, LogLevel, ResendAPIKey, EmailFrom, FrontendURL string; RedisClient *redis.Client;
+  Logger *slog.Logger; GoogleClientID, GoogleClientSecret, GoogleRedirectURL string}`.
   `CORS_ALLOWED_ORIGINS` (comma-separated, default `http://localhost:3000`); `APP_ENV`
-  (default `"development"`); `FRONTEND_URL` (default `http://localhost:3000`);
+  (default `"development"`); `LOG_LEVEL` (default `"info"` — `debug`/`info`/`warn`/`error`);
+  `FRONTEND_URL` (default `http://localhost:3000`);
   `REDIS_ADDR` (default `localhost:6380`); `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/
   `GOOGLE_REDIRECT_URL` (no default — security-sensitive, must match Google's
   console registration exactly). Passed to constructors via struct —
   never as individual args. `config.Load(cfg *Config) error` populates config
-  from the environment and validates that `DatabaseURL`, `JWTSecret`,
-  `ResendAPIKey`, and the three Google credentials are non-empty, returning
+  from the environment (building `Logger` via `pkg/logging.New(AppEnv, LogLevel)`
+  immediately after `AppEnv`/`LogLevel` are set, before any validation `return`,
+  so `cfg.Logger` is non-nil on every return path) and validates that `DatabaseURL`,
+  `JWTSecret`, `ResendAPIKey`, and the three Google credentials are non-empty, returning
   an error naming the first missing one — `EmailFrom`/`FrontendURL` are not
-  validated. `cmd/server/main.go` calls `Load` and `log.Fatal`s on its error,
-  then separately `Ping`s `RedisClient` (a live network call `Load` doesn't
-  perform) and `log.Fatal`s if unreachable — both checks happen at startup
-  before the server binds its listener.
-  `RedisClient` is a **deliberate, documented exception** to "Config holds only
-  primitive values": session revocation (middleware), rate limiting (router),
-  and two services all need the *same* client, and threading it through every
-  constructor individually was worse than holding it once, alongside the rest
-  of the shared config. `pgxpool.Pool` and the Resend client are **not** given
-  the same treatment — each has exactly one consumer
+  validated. `cmd/server/main.go` calls `Load`, logs via `cfg.Logger` (not `log.Fatal`
+  — see Logging below) and `os.Exit(1)`s on its error, then separately `Ping`s
+  `RedisClient` (a live network call `Load` doesn't perform) and exits if unreachable —
+  both checks happen at startup before the server binds its listener.
+  `RedisClient` and `Logger` are **deliberate, documented exceptions** to "Config holds only
+  primitive values": session revocation (middleware), rate limiting (router), request
+  logging (router), and every service/handler that logs all need the *same* instances,
+  and threading them through every constructor individually was worse than holding
+  them once, alongside the rest of the shared config. `pgxpool.Pool` and the Resend
+  client are **not** given the same treatment — each has exactly one consumer
   (`repository.NewRepoManager`, `service.NewServiceManager`), so there's no
   fan-out problem to solve for them; don't move them into `Config` without a
   reason that actually applies to them.
-- **Schema (migrations, all 8 tables)**: users, auth_identities, email_verification_tokens,
-  password_reset_tokens, plans, user_subscriptions, audit_events, sessions.
-- **Queries + generated code**: users (create/get-by-email/get-by-id/update-email-verified-at),
+- **Schema (migrations, 8 tables + 1 alter)**: users, auth_identities, email_verification_tokens,
+  password_reset_tokens, plans, user_subscriptions, audit_events, sessions, plus
+  `20260816170000_alter_users_add_profile_fields.sql` — `users.name` dropped to nullable
+  (registration no longer collects it) and `company_name TEXT`, `description TEXT`,
+  `social_links JSONB NOT NULL DEFAULT '{}'` added.
+  Account deletion needed no schema change at all — `users.deleted_at` already existed —
+  only three new queries (below).
+- **Queries + generated code**: users (create/get-by-email/get-by-id/update-email-verified-at/
+  **update-user-profile** — `sqlc.narg` + `COALESCE` per column for true partial-update
+  semantics, no hand-rolled dynamic SQL/**get-by-email-including-deleted** (no `deleted_at`
+  filter — the one query in this codebase that deliberately sees soft-deleted rows, used
+  only by `Register`'s reactivation branch)/**soft-delete-user**/**reactivate-user**),
   auth_identities (create/get-by-provider+subject/get-by-user+provider/update-password-hash),
   sessions (create/get-by-token-hash/mark-consumed/revoke-session/revoke-family/revoke-all-for-user/
   revoke-other-for-user), user_subscriptions (create/get-active-by-user-id),
   email_verification_tokens (create/get-by-hash/mark-consumed), password_reset_tokens
   (create/get-by-hash/mark-consumed).
-- **Domain models**: User, AuthIdentity, Session, Subscription, Plan/PLAN + `CreatePlan`,
+- **Domain models**: User (`Name`, `AvatarURL`, `CompanyName`, `Description` are all `*string` —
+  every profile field is optional and nil until set via `UpdateProfile`; `SocialLinks` is a
+  non-pointer `SocialLinks` struct, never nil, zero value means "no links set"; `DeletedAt
+  *time.Time` is nil on every normal lookup — all of them filter `WHERE deleted_at IS NULL`
+  — and is only ever non-nil on the row `GetUserByEmailIncludingDeleted` returns), AuthIdentity,
+  Session, Subscription, Plan/PLAN + `CreatePlan`,
   `TokenPair` (`models/token.go` — moved out of the service package since it crosses the
-  service↔handler boundary), `EmailVerificationToken`, `PasswordResetToken`.
+  service↔handler boundary), `EmailVerificationToken`, `PasswordResetToken`,
+  `UpdateProfileInput` (partial-patch input DTO — every field a pointer; nil = leave
+  unchanged). `models/social.go` — `SocialPlatform` string enum (website/x/instagram/
+  youtube/tiktok/discord/github/linkedin) with `Valid()`, mirroring the existing `PLAN`
+  enum style; `SocialLinks{Platforms map[SocialPlatform]string, Other []CustomSocialLink}` —
+  `Platforms` keys are validated against the closed enum (rejects typos like "diskord"
+  outright) while `Other` is a bounded (`MaxOtherSocialLinks = 5`) list of free-text
+  `{Label, URL}` pairs for platforms not yet in the enum, stored together as one JSONB
+  column, marshaled/unmarshaled in the repository layer.
+  `RegisterInput`/`RegisterRequest` now carry only `{Email, Password}` — registration
+  never collects or sets profile fields, for any provider (Google's `info.Name`/
+  `info.Picture` are deliberately discarded on signup too, never seeded onto the new
+  user — profile data is set exactly once, via `UpdateProfile`, regardless of how the
+  account was created).
   Request DTOs: `models/request.go` (RegisterRequest, LoginRequest, PasswordChangeRequest,
-  RequestEmailVerificationRequest, VerifyEmailRequest, RequestPasswordResetRequest,
-  ResetPasswordRequest).
-  Response DTOs: `models/response.go` (UserResponse, RefreshResponse, MeResponse,
-  MePlanResponse, MessageResponse — the generic `{"message":...}` shape shared by both
-  "request" endpoints).
+  **SetPasswordRequest**, RequestEmailVerificationRequest, VerifyEmailRequest,
+  RequestPasswordResetRequest, ResetPasswordRequest, **UpdateProfileRequest** — mirrors
+  `UpdateProfileInput`, pointer fields for partial-patch semantics).
+  Response DTOs: `models/response.go` (AuthResponse — `Name *string,omitempty` now, was a
+  plain string, RefreshResponse, MeResponse — gained `CompanyName`, `Description`,
+  `SocialLinks`, and **`HasPassword bool`** (not omitempty — the frontend needs to reliably
+  tell "false" from "field absent" to decide whether to show "set a password" or "change
+  password"), MePlanResponse, MessageResponse).
 - **Repository layer**: `RepoManager` + 6 entity repositories, `WithinTx` + context-injected
-  transactions, `dbXToDomain` mappers. `AuthIdentityRepository` includes
+  transactions, `dbXToDomain` mappers (now return `(models.User, error)` — an
+  unmarshal failure on the `SocialLinks` JSONB column is a real error, not silently
+  swallowed). `AuthIdentityRepository` includes
   `GetAuthIdentityByUserIDAndProvider` + `UpdatePasswordHash`. `SessionRepository` includes
   `RevokeSession`, `RevokeAllSessionsForUser`, `RevokeOtherSessionsForUser`. `UserRepository`
-  includes `UpdateEmailVerifiedAt`. `EmailVerificationTokenRepository` and
+  includes `UpdateEmailVerifiedAt` and **`UpdateProfile`** (converts each optional
+  `*string` to `pgtype.Text` via the shared `textOrNull` helper — nil means "leave
+  unchanged" under the query's `COALESCE`; marshals `SocialLinks` to JSON only when
+  non-nil), plus **`GetUserByEmailIncludingDeleted`**, **`SoftDelete`**, and
+  **`Reactivate`** for account deletion/reactivation. `EmailVerificationTokenRepository` and
   `PasswordResetTokenRepository` (`Create`/`GetByHash`/`MarkConsumed` each) mirror
   `SessionRepository`'s "return any row including used ones, let the service decide"
   pattern for `GetByHash`.
@@ -725,13 +831,70 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
   - `AuthService.Logout` — RevokeSession (idempotent)
   - `AuthService.LogoutAll` — RevokeAllSessionsForUser
   - `AuthService.RequestEmailVerification` — normalize/validate email → silent no-op if unknown or already verified → generate opaque token (24h expiry) → store hash → `EmailService.SendVerificationEmail`
-  - `AuthService.VerifyEmail` — hash lookup (unknown/expired → `ErrTokenInvalid`, used → `ErrTokenAlreadyUsed`) → WithinTx(UpdateEmailVerifiedAt + MarkConsumed) → return user + active subscription (same shape as `GetMe`)
+  - `AuthService.VerifyEmail` — hash lookup (unknown/expired → `ErrTokenInvalid`, used → `ErrTokenAlreadyUsed`) → WithinTx(UpdateEmailVerifiedAt + MarkConsumed) → return user + active subscription + `hasPasswordIdentity` (same shape as `GetMe`, including `HasPassword`)
   - `AuthService.RequestPasswordReset` — normalize/validate email → silent no-op if unknown → generate opaque token (1h expiry) → store hash → `EmailService.SendPasswordResetEmail`
   - `AuthService.ResetPassword` — validate new password → hash lookup (same invalid/used checks as above) → get password identity (`ErrPasswordNotSet` if OAuth-only) → Argon2id hash → WithinTx(UpdatePasswordHash + MarkConsumed + RevokeAllSessionsForUser)
   - `AuthService.GoogleAuthURL` — generates a CSRF state value (`utils/token.Generate`) and returns it plus `GoogleOAuthClient.AuthURL(state)`
-  - `AuthService.GoogleCallback` — exchange code → `FetchUserInfo` → reject `ErrOAuthEmailNotVerified` if unverified → existing `google` identity signs in as-is → else a matching verified email attaches a new `google` identity to that existing account (no `WithinTx`, single write) → else `WithinTx` creates a new user + `google` identity + free subscription → issue JWT + refresh token. `Register` gained a matching branch: an email match with no existing `password` identity attaches one instead of rejecting (`attachPasswordIdentity`) — the two flows are symmetric, so an account can carry both a `password` and a `google` identity (the `auth_identities` schema already allows multiple rows per `user_id`; no migration needed)
-  - `UserService.GetMe` — GetUserByID + GetActiveSubscriptionByUserID
+  - `AuthService.GoogleCallback` — exchange code → `FetchUserInfo` → reject `ErrOAuthEmailNotVerified` if unverified → existing `google` identity signs in as-is → else a matching verified email attaches a new `google` identity to that existing account (no `WithinTx`, single write) → else `WithinTx` creates a new user + `google` identity + free subscription → issue JWT + refresh token. `Register` gained a matching branch: an email match with no existing `password` identity attaches one instead of rejecting (`attachPasswordIdentity`) — the two flows are symmetric, so an account can carry both a `password` and a `google` identity (the `auth_identities` schema already allows multiple rows per `user_id`; no migration needed). **Google's `info.Name`/`info.Picture` are never seeded onto the created user** — the brand-new-user branch sets only `ID`/`Email`/`EmailVerifiedAt`, exactly like the password `Register` path; profile fields are set exactly once, via `UpdateProfile`, regardless of provider (this was a deliberate correction mid-session — an earlier version of this branch did seed `Name`/`AvatarURL` from Google, which was wrong per the two-phase-registration design)
+  - `UserService.GetMe` — GetUserByID + GetActiveSubscriptionByUserID + `hasPasswordIdentity`
+    (a package-level helper shared with `AuthService.VerifyEmail`, since both feed the
+    same `MeResponse` shape: `GetAuthIdentityByUserIDAndProvider(ctx, userID, "password")`,
+    `err == nil` → true, `ErrUserNotFound` → false, otherwise propagate) — returns
+    `(models.User, models.Subscription, bool, error)`, the bool being `HasPassword`
   - `UserService.ChangePassword` — validate new password → get password identity (ErrPasswordNotSet if OAuth-only) → verify current password → Argon2id hash → WithinTx(UpdatePasswordHash + RevokeOtherSessionsForUser keeping current session)
+  - `UserService.SetPassword(ctx, userID, sessionID, newPassword)` — sets an *initial*
+    password (e.g. for an OAuth-only account), never verifies a current one (there isn't
+    one): validate new password → reject with `ErrPasswordAlreadySet` if a password
+    identity already exists → hash → `WithinTx`(`CreateAuthIdentity` with
+    `Provider:"password", ProviderSubject:user.Email` + `RevokeOtherSessionsForUser`
+    keeping the current session) → `SessionRevoker.RevokeSessions`. Mirrors
+    `ChangePassword`'s session-revocation safety property: if a hijacked session silently
+    added a password credential, the legitimate user's other sessions die and they'll notice.
+  - `UserService.UpdateProfile(ctx, userID, input)` — partial patch: each non-nil field in
+    `UpdateProfileInput` is validated (`validate.Name`/`URL`/`CompanyName`/`Description`;
+    `SocialLinks.Platforms` keys checked against `SocialPlatform.Valid()`, `Other` capped
+    at `MaxOtherSocialLinks` and each entry's label/URL validated) then passed to
+    `UserRepository.UpdateProfile` as-is; any failure returns `msgs.ErrInvalidInput` (new
+    sentinel — see Validation below). No transaction needed (single-row, single-table).
+  - `UserService.DeleteAccount(ctx, userID, sessionID, currentPassword)` — soft-deletes
+    (`users.deleted_at = now()`, hiding the row from every other lookup) and revokes every
+    active session. If the account has a password identity, `currentPassword` must match
+    first (`ErrInvalidCredentials` otherwise) — mirrors `ChangePassword`'s confirmation
+    step; skipped entirely for an OAuth-only account. **The account and its email are
+    retained, not purged** — `users.email` stays a permanent `UNIQUE` constraint
+    (deliberately never relaxed to a partial index) so a deleted account's email is
+    preserved for record-keeping/contact purposes. See `AuthService.reactivateAccount`
+    below for the other half of this design.
+  - `AuthService.Register`'s existing-email branch now uses
+    `UserRepository.GetUserByEmailIncludingDeleted` (the only caller of this
+    non-deleted-filtered query) instead of `GetUserByEmail`, and branches three ways:
+    no row → create a new account (unchanged); row exists, not deleted →
+    `attachPasswordIdentity` (unchanged); **row exists, deleted →
+    `reactivateAccount`** — clears `deleted_at`, sets the password identity to the
+    newly supplied password (updates the existing hash if one exists, creates a new
+    identity if the account had been OAuth-only), and signs the caller in as the
+    *same* account/ID/history. This is the intentional consequence of keeping
+    `users.email` permanently unique: a second `Register` with a deleted account's
+    email can never create a new row, so it's treated as a deliberate restoration
+    instead of failing.
+  - **Bug found and fixed while building this**: `AuthService.Login` authenticates via
+    `auth_identities` (untouched by soft-delete) *before* ever touching `users`, so a
+    correct password still verifies successfully for a deleted account; the final
+    `GetUserByID` call (deleted-filtered) then used to leak a raw `ErrUserNotFound`
+    (404) instead of the generic `ErrInvalidCredentials` every other Login failure
+    returns — breaking the account-enumeration defense for exactly the accounts where
+    it matters. Fixed by translating that specific `ErrUserNotFound` into
+    `ErrInvalidCredentials`. `AuthService.VerifyEmail` and `AuthService.ResetPassword`
+    gained an equivalent guard — an explicit `GetUserByID` check (translating
+    `ErrUserNotFound` → `ErrTokenInvalid`) right after the token's expiry/used-at
+    checks and before any mutation — closing the same class of gap: neither flow
+    otherwise reads `users` at all, so a token issued before deletion would otherwise
+    still work after it. `GoogleCallback` has the same latent `GetUserByID` call for a
+    deleted account's existing `google` identity, but wasn't fixed — it never exposes
+    a distinguishable error to the client either way (always a generic
+    `?error=oauth_failed` redirect), so there's no enumeration leak, only a
+    slightly-misleading `Error`-level log line for what is actually an expected case;
+    left as a minor follow-up rather than in scope here.
   - `EmailService` (`SendVerificationEmail`/`SendPasswordResetEmail`) — always
     Resend-backed (`emailService`); `RESEND_API_KEY` is required at startup
     (`cmd/server/main.go` fails fast if unset), no dev/noop fallback; consumed
@@ -767,16 +930,29 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
 - **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll/
   RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/
   GoogleCallback) + `UserHandler`
-  (GetMe/ChangePassword — renamed from `MeHandler` since it will grow to cover profile
-  operations beyond `/me`). Logout/LogoutAll clear cookies via `utils/cookies.ClearTokenCookies`.
-  GetMe and VerifyEmail both wrap in `{"data": <MeResponse>}` — VerifyEmail reuses the exact
-  same response shape (auth spec §7.2 calls for "the authenticated user's public account
-  representation", which is what `GET /api/v1/me` already returns). RequestEmailVerification
+  (GetMe/ChangePassword/**SetPassword**/**UpdateProfile**/**DeleteAccount** — renamed from
+  `MeHandler` since it grew to cover profile operations beyond `/me`). Logout/LogoutAll/
+  DeleteAccount clear cookies via `utils/cookies.ClearTokenCookies` (DeleteAccount too — the
+  session it was called with no longer exists once the account is deleted).
+  GetMe, UpdateProfile, and VerifyEmail all wrap in `{"data": <MeResponse>}`, built by the
+  shared `toMeResponse(user, sub, hasPassword)` helper in `user_handler.go` — VerifyEmail
+  reuses the exact same response shape (auth spec §7.2 calls for "the authenticated user's
+  public account representation", which is what `GET /api/v1/me` already returns).
+  UpdateProfile calls `UserService.UpdateProfile` then re-fetches via `GetMe` to build the
+  full response (accepts one extra cheap single-row lookup rather than growing
+  `UpdateProfile`'s return shape to also carry the subscription/has-password data).
+  RequestEmailVerification
   and RequestPasswordReset always respond 200 with a fixed generic `MessageResponse` message
   regardless of whether the target email exists (enumeration defense) — the handler doesn't
-  branch on the service's outcome. ResetPassword responds 204, consistent with
-  `UserHandler.ChangePassword`. Both `UserHandler` methods read claims via
+  branch on the service's outcome. ResetPassword and SetPassword respond 204, consistent with
+  `UserHandler.ChangePassword`. All four `UserHandler` methods read claims via
   `middleware.AuthClaims(r)`.
+  Every JSON body decode across both handler files (11 call sites) goes through the new
+  `response.DecodeJSON(w, r, &req) bool` helper instead of a hand-rolled
+  `json.NewDecoder(r.Body).Decode(&req)` block — it calls `DisallowUnknownFields()` before
+  decoding (an unrecognized field is now a 400 `INVALID_BODY`, not silently ignored) and
+  writes the standard error response itself on failure, so call sites are just
+  `if !response.DecodeJSON(w, r, &req) { return }`.
   `GoogleStart`/`GoogleCallback` are the first handlers in this codebase to
   respond with an HTTP redirect (302) rather than JSON, on both success and
   failure — the browser reaches them via top-level navigation, not `fetch`.
@@ -806,6 +982,8 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
     (multi-instance safe) or a Postgres query (adds real DB load to every request).
   - `cors.go` — `CORS(allowedOrigins)`: explicit allowlist, echoes origin (never `*`), `Vary: Origin`, preflight 204
   - `securityheaders.go` — `SecurityHeaders(appEnv)`: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, `default-src 'none'` CSP, HSTS (production only)
+  - `requestlog.go` — `RequestLogger(base *slog.Logger)`: assigns each request a `uuid.NewString()` request ID, sets it on the `X-Request-ID` response header, injects a logger enriched with it (`base.With("request_id", id)`) into the request context via `internal/utils/logctx`, wraps the response writer in an unexported `statusRecorder` to capture the status code, and logs one `Info` "http request" line per request (method/path/status/duration_ms) after it completes. `LoggerFromContext(r) *slog.Logger` is the handler-facing accessor (mirrors `AuthClaims(r)`), never nil (falls back to `slog.Default()` outside the middleware chain). Must be the outermost global middleware so it observes every request, including CORS preflights and unmatched routes, and the request ID exists before anything else runs.
+  - `maxbody.go` — `MaxBody(limit int64)`: wraps `r.Body` in `http.MaxBytesReader(w, r.Body, limit)`. `MaxRequestBodyBytes = 1MB` — generous for today's text-only JSON API; scoped only to today's routes, not a blanket rule — product file uploads (once built) will go through a presigned R2 PUT URL directly, never through this server's handlers, so this cap never needs revisiting for that. A body over the limit surfaces as a normal JSON decode error (400 `INVALID_BODY` via `response.DecodeJSON`), not a distinct status — deliberate simplicity, not an oversight.
 - **Rate limiting** (`internal/redis/ratelimit.go`, not `internal/middleware/` — see
   `internal/redis` above): `NewRateLimiter(client, name, limit, window)` — per-IP fixed-window
   middleware, `INCR` + `EXPIRE`-on-first-hit against Redis, shared across every instance.
@@ -814,11 +992,44 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
 - **Router** (`internal/router/router.go`): `SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler` —
   builds `requireAuth`/the rate-limiter factory from `cfg.RedisClient` (unchanged signature —
   the client travels on `cfg`, which `SetupRoutes` already receives), wires per-route
-  middleware chains, wraps mux in global security headers + CORS middleware, returns the
-  assembled handler.
+  middleware chains, wraps mux in global middleware: `RequestLogger` (outermost) →
+  `SecurityHeaders` → `CORS` → `MaxBody` → mux, returns the assembled handler.
+- **Logging** (`pkg/logging`, `internal/utils/logctx`, `internal/middleware/requestlog.go`):
+  stdlib `log/slog` only — no new dependency. `pkg/logging.New(appEnv, levelName) *slog.Logger`
+  builds JSON output in production, human-readable text otherwise, level parsed from
+  `LOG_LEVEL` (defaults to `info` on empty/unrecognized so a typo never blocks startup).
+  `internal/utils/logctx` is the context-propagation seam — `WithLogger`/`FromContext` — kept
+  as its own tiny package specifically to avoid an import cycle: `internal/middleware` already
+  imports `internal/utils/response` (for `RequireAuth`'s error responses), so `response`
+  cannot import `middleware` back; `logctx` has no further internal deps and both sides import
+  it instead. `response.HandleError` now takes `(w, r, err)` (was `(w, err)`) and logs via
+  `logctx.FromContext(r.Context())` — every *matched* sentinel is logged now, not just
+  unmapped errors: `Warn` for client errors (status &lt; 500, e.g. a bad login), `Error` for
+  500-mapped sentinels (currently just `ErrSubscriptionNotFound`, previously invisible
+  server-side despite representing a real internal-consistency violation) and genuinely
+  unmapped errors. Design principle: logging stays at the edges (`main`, `RequestLogger`,
+  `HandleError`'s fallback, the two OAuth handler-level failure logs) — `internal/service`
+  and `internal/repository` get zero logging calls, since errors already propagate as
+  sentinels to the HTTP boundary and get logged exactly once there.
 - **JWT tokens**: `internal/utils/jwttoken` — HS256, 15-min lifetime, claims:
   UserID/SessionID/PlanKey. `Issue` + `Verify` (rejects expired, wrong key, alg:none).
-- **Routes** (all wired in `internal/router/router.go`, global middleware: security headers + CORS):
+- **Input validation & password policy** (`internal/utils/validate/validate.go`): `Password` —
+  length 12–72 bytes **and** requires at least one uppercase, one lowercase, one digit, and
+  one special character (anything not a letter/digit/whitespace); a length-only check was
+  the old behavior, tightened this session. `Email` — length-capped (`MaxEmailLength = 254`,
+  RFC 5321) and rejects the RFC 5322 `"Display Name <addr>"` form (`net/mail.ParseAddress`
+  accepts it; the parsed address is compared back against the full input to ensure only a
+  bare address was given). `Name`/`CompanyName`/`Description`/`CustomLinkLabel`/`URL` all
+  reject invalid UTF-8, control characters, and Unicode bidi-override characters (the
+  "Trojan Source" class) via a shared unexported `hasDangerousChars(s, allowNewline)` —
+  `Description` is the one field that allows a bare `\n` (paragraph breaks in a bio); `\r`
+  is never allowed anywhere. Argon2id hashing itself (`pkg/hash`, `m=64MB, t=3, p=2`,
+  `crypto/rand` salt, `subtle.ConstantTimeCompare` verify) was already well above OWASP
+  minimums and is unchanged. SQL injection was audited and found already structurally
+  prevented — every DB access goes through sqlc-generated, pgx-parameterized queries
+  (Rule C1 forbids anything else) — no code changes were needed there.
+- **Routes** (all wired in `internal/router/router.go`, global middleware: request logging →
+  security headers → CORS → body-size cap):
   - `GET /health` — public, no rate limit
   - `POST /api/v1/auth/register` — 5/hour rate limit
   - `POST /api/v1/auth/login` — 10/15min rate limit
@@ -829,42 +1040,76 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
   - `POST /api/v1/auth/logout-all` — 5/15min rate limit + RequireAuth
   - `GET /api/v1/me` — 60/15min rate limit + RequireAuth
   - `POST /api/v1/me/password/change` — 5/15min rate limit + RequireAuth
+  - `POST /api/v1/me/password/set` — 5/15min rate limit + RequireAuth (sets an initial
+    password on an account with none yet; 409 `PASSWORD_ALREADY_SET` otherwise)
+  - `PATCH /api/v1/me/profile` — 20/15min rate limit + RequireAuth (partial profile update)
+  - `DELETE /api/v1/me` — 5/15min rate limit + RequireAuth (soft-deletes the account,
+    requires `current_password` when one is set, clears cookies)
   - `POST /api/v1/auth/email/verification/request` — 5/hour rate limit, public
   - `POST /api/v1/auth/email/verification/verify` — 10/15min rate limit, public
   - `POST /api/v1/auth/password/reset/request` — 5/hour rate limit, public
   - `POST /api/v1/auth/password/reset/confirm` — 10/15min rate limit, public
-  (Rate limits for these four are not spec-mandated numbers — the spec only says
+  (Rate limits for these are not spec-mandated numbers — the spec only says
   they "should" be protected — chosen to match the existing scheme: email-sending
-  endpoints get `register`'s 5/hour, token-consuming endpoints get `login`'s 10/15min.)
+  endpoints get `register`'s 5/hour, token-consuming endpoints get `login`'s 10/15min,
+  `me-profile-update` sits between `me`'s 60/15min read rate and `me-password-change`'s
+  5/15min since it's a routine write but still a write; `me-delete` matches
+  `me-password-change`/`me-password-set` since it's the same class of sensitive,
+  confirmation-gated action.)
 - **Tests** (under root `test/`, per §3.9/Q6):
-  - `test/service/auth_service_test.go` — Register (success/email-exists/invalid-input/attach-password-to-existing-google-account), Login (success/4 invalid paths), Refresh (success/reuse/expired), Logout, LogoutAll, RequestEmailVerification (success/unknown-email/already-verified), VerifyEmail (success/not-found/expired/already-used), RequestPasswordReset (success/unknown-email), ResetPassword (success/token-invalid/token-already-used/oauth-only/weak-password), GoogleAuthURL (success), GoogleCallback (existing-google-user/attach-to-existing-password-account/new-user/email-not-verified/exchange-failure/userinfo-fetch-failure) — plus the shared `fakeRepo`/`fakeUserRepo`/`fakeIdentityRepo`/`fakeSessionRepo`/`fakeSubscriptionRepo`/`fakeEmailVerificationTokenRepo`/`fakePasswordResetTokenRepo`/`fakeEmailService`/`fakeGoogleOAuthClient`/`newTestAuthService` fixtures used across all service test files
-  - `test/service/user_service_test.go` — GetMe (success/not-found), ChangePassword (success/invalid-creds/oauth-only/weak-password)
+  - `test/service/auth_service_test.go` — Register (success/email-exists/invalid-input/attach-password-to-existing-google-account/**reactivates-deleted-account-with-existing-password/reactivates-deleted-account-was-oauth-only**), Login (success/4 invalid paths/**deleted-account → generic ErrInvalidCredentials, not a leaked 404**), Refresh (success/reuse/expired), Logout, LogoutAll, RequestEmailVerification (success/unknown-email/already-verified), VerifyEmail (success/not-found/expired/already-used/**deleted-account → ErrTokenInvalid**), RequestPasswordReset (success/unknown-email), ResetPassword (success/token-invalid/token-already-used/oauth-only/weak-password/**deleted-account → ErrTokenInvalid**), GoogleAuthURL (success), GoogleCallback (existing-google-user/attach-to-existing-password-account/new-user/email-not-verified/exchange-failure/userinfo-fetch-failure) — plus the shared `fakeRepo`/`fakeUserRepo`/`fakeIdentityRepo`/`fakeSessionRepo`/`fakeSubscriptionRepo`/`fakeEmailVerificationTokenRepo`/`fakePasswordResetTokenRepo`/`fakeEmailService`/`fakeGoogleOAuthClient`/`newTestAuthService` fixtures used across all service test files (`fakeUserRepo.GetUserByID` now defaults to "found, not deleted" when its `getByID` field is unset, so pre-existing tests that never configured it don't panic against the new deleted-account guards)
+  - `test/service/user_service_test.go` — GetMe (success/not-found/has-password reflects identity state), ChangePassword (success/invalid-creds/oauth-only/weak-password), SetPassword (success/already-set/weak-password), UpdateProfile (success per field/each validation failure/partial-patch leaves other fields untouched), **DeleteAccount (success-with-password/success-oauth-only/wrong-password)**
   - `test/service/email_service_test.go` — SendVerificationEmail/SendPasswordResetEmail (success + non-2xx) against a fake `http.RoundTripper`, no network access
-  - `test/handlers/auth_handler_test.go` — Register/Login/Refresh/Logout/LogoutAll/RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/GoogleCallback (happy paths + key error paths); `redirectLocation` is the new helper for asserting `Location` headers on the two redirect-based endpoints
-  - `test/handlers/user_handler_test.go` — GetMe/ChangePassword (happy paths + key error paths)
-  - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer/revoked-session/revocation-check-error), AuthClaims outside protected route
+  - `test/handlers/auth_handler_test.go` — Register/Login/Refresh/Logout/LogoutAll/RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/GoogleCallback (happy paths + key error paths, incl. unknown-JSON-field rejection); `redirectLocation` is the helper for asserting `Location` headers on the two redirect-based endpoints
+  - `test/handlers/user_handler_test.go` — GetMe/ChangePassword/SetPassword/UpdateProfile (happy paths + key error paths, incl. the Discord-typo/too-many-custom-links 400s)
+  - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer/revoked-session/revocation-check-error), AuthClaims outside protected route, `RequestLogger` (request-ID header/access-log line/context propagation/status default), `MaxBody` (under/over limit)
   - `test/redis` — `SessionRevocationStore` (not-revoked-by-default, single/bulk revoke), `NewRateLimiter` (allow-under-limit, reject-over-limit, per-name isolation, window reset) — all against `miniredis`, no live Redis needed for the suite
   - `test/jwttoken` — Issue/Verify roundtrip, wrong key, tampered, malformed, alg:none, duration constant, distinct tokens
   - `test/oauthstate` — Sign/Verify roundtrip, wrong secret, mismatched query state, tampered signature, malformed cookie value, SetCookie/ClearCookie attributes
-  - `test/hash`, `test/token`, `test/validate`
-- **Helpers**: `pkg/dotenv`, `pkg/hash` (Argon2id PHC), `utils/token` (opaque token + SHA-256),
-  `utils/validate`, `utils/response` (envelope, codes, `errorStatusMap`, `HandleError`),
-  `utils/jwttoken`, `utils/cookies` (auth cookie set/clear), `utils/oauthstate` (signed OAuth
-  CSRF state cookie), `msgs` sentinel errors — verification/reset needed no new sentinels
-  (`ErrTokenInvalid`/`ErrTokenAlreadyUsed`/`ErrPasswordNotSet`/`ErrInvalidCredentials` already
-  covered every failure mode); Google OAuth added exactly one, `ErrOAuthEmailNotVerified`.
+  - `test/response` — `HandleError` (mapped/unmapped, Warn-vs-Error log level split), `DecodeJSON` (valid/unknown-field/malformed)
+  - `test/hash`, `test/token`, `test/validate` (Password composition, Email length-cap +
+    display-name rejection, control-char/bidi-override/invalid-UTF-8 cases across every
+    free-text validator)
+- **Helpers**: `pkg/dotenv`, `pkg/hash` (Argon2id PHC), `pkg/logging` (slog construction),
+  `utils/token` (opaque token + SHA-256), `utils/validate`, `utils/response` (envelope, codes,
+  `errorStatusMap`, `HandleError`, `DecodeJSON`), `utils/jwttoken`, `utils/cookies` (auth
+  cookie set/clear), `utils/oauthstate` (signed OAuth CSRF state cookie), `utils/logctx`
+  (request-scoped logger context propagation), `msgs` sentinel errors — verification/reset
+  needed no new sentinels (`ErrTokenInvalid`/`ErrTokenAlreadyUsed`/`ErrPasswordNotSet`/
+  `ErrInvalidCredentials` already covered every failure mode); Google OAuth added
+  `ErrOAuthEmailNotVerified`; profile updates added `ErrInvalidInput` (400, for validation
+  failures outside a credentials context — the first real use of the previously-unused
+  `CodeInvalidInput`); `SetPassword` added `ErrPasswordAlreadySet` (409).
 
 ### Not yet implemented (from the specs)
 
+- Panic recovery middleware — Go's stdlib `net/http` already recovers a panic per-connection
+  so one handler panicking doesn't crash the process, but today that recovery just drops the
+  connection with no HTTP response and logs an unstructured stack trace to stderr, bypassing
+  `RequestLogger`'s structured logger and request-ID correlation entirely. Audited the
+  codebase for live, reachable panic sources (unchecked type assertions, unguarded pointer
+  dereferences, unchecked-length slice indexing) as of 2026-08-16 and found none — every
+  pointer dereference and type assertion in `internal/` is already guarded — so this is
+  defense-in-depth against third-party library panics and future code, not a fix for a known bug.
 - Google account linking/unlinking as explicit, authenticated self-service endpoints
   (`POST /api/v1/me/auth-identities/google/link`, `DELETE /api/v1/me/auth-identities/google`,
   auth spec §18) — login/signup (§17) is done, and it already links a `google` identity to an
   existing account by verified-email match, but there's no way for an authenticated user to
-  add/remove a Google identity outside of that automatic path
+  add/remove a Google identity outside of that automatic path. Deprioritized by the user
+  (2026-08-16) as not urgent right now.
 - Audit events (`audit_events` table exists; nothing writes to it yet — not even
-  Register/Login/the verification/reset/Google flows; deliberately deferred as one
-  cross-cutting pass across all endpoints rather than partial per-endpoint coverage)
-- Account deletion, email change
+  Register/Login/the verification/reset/Google/DeleteAccount flows; deliberately deferred as
+  one cross-cutting pass across all endpoints rather than partial per-endpoint coverage)
+- Email change (account deletion — with reactivation on re-registration — landed 2026-08-16;
+  see `DeleteAccount`/`reactivateAccount` above)
+- New-device/new-location login alert emails — considered and deliberately deferred; see
+  `DOCS/PRODUCT_VISION.md` §11 idea log (2026-08-16 entry) for the reasoning (naive IP/UA
+  matching would false-positive for mobile/VPN users) and the intended shape once designed
+  properly. `POST /api/v1/me/password/set` (this session) is exactly what its OAuth-only-account
+  call-to-action would use.
+- Full MFA/step-up authentication (requiring both an OAuth login AND the account's password
+  together) — deliberately out of scope; `SetPassword` gives an OAuth-only account a *fallback*
+  credential, not an added factor. Would be its own dedicated design if ever wanted.
 - Automatic verification email on `Register` (verification is opt-in via
   `POST /api/v1/auth/email/verification/request` today — `Register` is unchanged)
 - Everything in `plans_and_entitlements_v1_backend_spec.md` beyond the plan
@@ -872,19 +1117,17 @@ Snapshot as of 2026-08-15 (Google OAuth login/signup added on top of email verif
 
 ### Suggested next steps (in order of priority)
 
-1. **Logging** — introduce structured, production-grade logging across the app.
-   Today logging is just scattered `log.Printf`/`log.Println` calls (`cmd/server/main.go`,
-   `internal/utils/response/handle.go`, `internal/handlers/auth_handler.go`, …) with
-   no structure, levels, or consistent fields — fine for local dev, not for anything
-   resembling real observability. This blocks/precedes the items below. Approach
-   (library, format, correlation IDs, what gets logged where) is not decided yet —
-   design it in a dedicated session, don't guess at it piecemeal per-feature.
-2. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
-3. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
-   existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, the
-   verification/reset/Google flows, …), not bolted onto one feature at a time
-4. **Google account linking/unlinking** — the explicit self-service endpoints from §18,
-   now that login/signup (§17) has landed
+1. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
+   existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, SetPassword,
+   UpdateProfile, DeleteAccount, the verification/reset/Google flows, …), not bolted onto
+   one feature at a time
+2. **Panic recovery middleware** — cheap, no design decisions, no known live bug; do
+   whenever convenient
+3. **Sensitive operations / recent authentication** (auth spec §33) — needs a definition of
+   what counts as "sensitive" and how "recent" a login must be before this is actionable
+4. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
+5. **Google account linking/unlinking** — the explicit self-service endpoints from §18;
+   deprioritized by the user as not urgent
 
 ---
 
@@ -905,4 +1148,8 @@ Before declaring any task done, verify **all** of:
 - [ ] No secrets/raw tokens in logs, errors, or commits (S2)
 - [ ] `internal/db/generated` untouched by hand (A3)
 - [ ] No spec section implemented beyond the task scope (F4)
+- [ ] Every new/changed route added to the Postman collection and documented in
+      `postman.md` with QA testing combinations, in the same pass (F5)
+- [ ] Any new logging calls use the existing pipeline and live at the edges
+      (handlers/middleware/main), not inside `internal/service`/`internal/repository` (O1)
 - [ ] No unanswered questions left open — anything uncertain was asked (G1)

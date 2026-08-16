@@ -176,7 +176,7 @@ Do not expose internal database errors, stack traces, token values, password-has
 
 # 6. Authentication Endpoints
 
-## 6.1 Register 🟡 PARTIAL — core flow implemented (normalize → existing-account check → Argon2id → user + free plan + password identity + session issuance) and wired at `POST /api/v1/auth/register`; missing: email-verification challenge (step 7) and verification email (step 8); session created unconditionally (step 9 product-policy not applied). ⚠ Returns 409 `EMAIL_ALREADY_EXISTS` on existing email — spec suggests a generic response to prevent account enumeration (decision needed). Response is `models.AuthResponse` (id, email, name, expires_at).
+## 6.1 Register 🟡 PARTIAL — core flow implemented (normalize → existing-account check → Argon2id → user + free plan + password identity + session issuance) and wired at `POST /api/v1/auth/register`; missing: email-verification challenge (step 7) and verification email (step 8); session created unconditionally (step 9 product-policy not applied). ⚠ Returns 409 `EMAIL_ALREADY_EXISTS` on existing email — spec suggests a generic response to prevent account enumeration (decision needed). Response is `models.AuthResponse` (id, email, expires_at). **⚠ Deliberate divergence from this section as originally written (2026-08-16): registration no longer collects or sets `name`.** Profile fields (name, avatar, company name, description, social links) are set exclusively via `PATCH /api/v1/me/profile` as a second phase, after authentication — for any provider, including Google (Google's `name`/`picture` claims are discarded on signup too, never seeded). See §14 and the new Profile Management endpoint below.
 
 ```http
 POST /api/v1/auth/register
@@ -187,17 +187,15 @@ Request:
 ```json
 {
   "email": "user@example.com",
-  "password": "strong-password",
-  "name": "Jane Doe"
+  "password": "Strong-Passw0rd!"
 }
 ```
 
 Validation:
 
-- email must be syntactically valid
+- email must be syntactically valid, ≤254 bytes, and a bare address (the RFC 5322 `"Display Name <addr>"` form is rejected)
 - normalize email consistently
-- password must meet the configured minimum security requirements
-- name length must be bounded
+- password must be 12–72 bytes and contain at least one uppercase letter, one lowercase letter, one digit, and one special character
 - reject obviously malformed input
 
 Behavior:
@@ -205,7 +203,7 @@ Behavior:
 1. Normalize email.
 2. Check whether an account already exists.
 3. Hash password using Argon2id.
-4. Create the user.
+4. Create the user (`name`/`avatar_url`/`company_name`/`description` left unset).
 5. Assign the default `free` plan.
 6. Create an email/password authentication identity.
 7. Create an email-verification challenge.
@@ -223,12 +221,50 @@ Recommended response:
 {
   "id": "uuid",
   "email": "user@example.com",
-  "name": "Jane Doe",
   "expires_at": "2026-08-12T10:15:00Z"
 }
 ```
 
 `expires_at` is the expiry of the issued access token. Clients should use this to schedule a proactive background refresh timer immediately after registration, so the first silent refresh fires before the token lapses rather than waiting for a 401.
+
+### 6.1.1 Profile Management (added 2026-08-16, not in the original spec)
+
+Registration collects only `email`/`password`. Everything else about a user's public
+identity is set afterward, as an authenticated action:
+
+```http
+PATCH /api/v1/me/profile
+```
+
+Partial patch — every field is optional; an omitted field is left unchanged, an
+explicitly-sent field (including an empty string) replaces the current value:
+
+```json
+{
+  "name": "Jane Doe",
+  "avatar_url": "https://example.com/avatar.png",
+  "company_name": "Jane's Templates",
+  "description": "I make Notion templates.",
+  "social_links": {
+    "platforms": {"discord": "https://discord.gg/xyz"},
+    "other": [{"label": "Slack", "url": "https://joinslack.example/xyz"}]
+  }
+}
+```
+
+`social_links.platforms` keys are validated against a closed enum (website, x, instagram,
+youtube, tiktok, discord, github, linkedin) — an unrecognized key (e.g. a typo like
+`"diskord"`) is rejected with 400 `INVALID_INPUT`, not silently stored, so the frontend can
+always map a known key to a brand icon. `social_links.other` is a bounded (max 5) list of
+free-text `{label, url}` pairs for platforms not yet in the enum, rendered with a generic
+icon. Responds `200` with the same `{"data": <MeResponse>}` shape `GET /api/v1/me` uses.
+Rate limit: 20/15min.
+
+Also added: `POST /api/v1/me/password/set` — sets an *initial* password on an account with
+no password identity yet (e.g. an OAuth-only account); 409 `PASSWORD_ALREADY_SET` if one
+already exists. Distinct from `POST /api/v1/me/password/change` (§15), which requires and
+verifies a *current* password. See §14 for the `has_password` field that tells a client
+which of the two endpoints to offer.
 
 Do not reveal whether a particular email is already registered in a way that enables account enumeration. If registration encounters an existing account, use a generic response where appropriate.
 
@@ -290,7 +326,7 @@ Return the authenticated user's public account representation.
 
 ---
 
-# 8. Email/Password Login ✅ DONE — full flow implemented: normalize → find password identity → `hash.VerifyPassword` → issue JWT access token + opaque refresh token → set HttpOnly cookies → 200 `AuthResponse` (id, email, name, expires_at). Unknown email, wrong password, and OAuth-only accounts all return the same `INVALID_CREDENTIALS` (enumeration defense). Registered at `POST /api/v1/auth/login` with 10/15min rate limit. Still missing: audit event (§31)
+# 8. Email/Password Login ✅ DONE — full flow implemented: normalize → find password identity → `hash.VerifyPassword` → issue JWT access token + opaque refresh token → set HttpOnly cookies → 200 `AuthResponse` (id, email, expires_at — `name` dropped 2026-08-16, see §6.1). Unknown email, wrong password, a deleted account (fixed 2026-08-16, see §32.2), and OAuth-only accounts all return the same `INVALID_CREDENTIALS` (enumeration defense). Registered at `POST /api/v1/auth/login` with 10/15min rate limit. Still missing: audit event (§31)
 
 ```http
 POST /api/v1/auth/login
@@ -490,7 +526,7 @@ This is important after:
 
 ---
 
-# 14. Current User ✅ DONE — `GET /api/v1/me`; RequireAuth → reads userID from JWT claims → GetUser + GetActiveSubscription → 200 `{"data":{id,email,email_verified,name,avatar_url,plan:{id,status}}}`. Never returns hashes or tokens.
+# 14. Current User ✅ DONE — `GET /api/v1/me`; RequireAuth → reads userID from JWT claims → GetUser + GetActiveSubscription + has-password-identity check → 200 `{"data":{id,email,email_verified,name,avatar_url,company_name,description,social_links,has_password,plan:{id,status}}}`. Never returns hashes or tokens. `name`/`avatar_url`/`company_name`/`description` are all `omitempty` (nil until set via §6.1.1's `PATCH /api/v1/me/profile`) — `has_password` is deliberately **not** `omitempty`, since the client needs to reliably tell "false" apart from "field absent" to decide whether to offer "set a password" (§6.1.1) or "change password" (§15).
 
 ```http
 GET /api/v1/me
@@ -508,6 +544,13 @@ Response should include only safe public/account data:
     "email_verified": true,
     "name": "Jane Doe",
     "avatar_url": "...",
+    "company_name": "Jane's Templates",
+    "description": "I make Notion templates.",
+    "social_links": {
+      "platforms": {"discord": "https://discord.gg/xyz"},
+      "other": [{"label": "Slack", "url": "https://joinslack.example/xyz"}]
+    },
+    "has_password": true,
     "plan": {
       "id": "free",
       "status": "active"
@@ -1015,11 +1058,13 @@ Do not use `401` for authorization failures. Use `403` when the user is authenti
 
 ---
 
-# 26. Security Requirements ✅ DONE — Argon2id ✅ (`pkg/hash`, explicit memory/iterations/parallelism), crypto/rand tokens + hashed storage ✅ (`utils/token`), token expiry + single-use rotation + reuse detection ✅ (in `AuthService.Refresh`), HttpOnly+Secure+SameSite=Lax cookies ✅, CORS allowlist ✅, security headers ✅, per-route rate limiting ✅
+# 26. Security Requirements ✅ DONE — Argon2id ✅ (`pkg/hash`, explicit memory/iterations/parallelism), crypto/rand tokens + hashed storage ✅ (`utils/token`), token expiry + single-use rotation + reuse detection ✅ (in `AuthService.Refresh`), HttpOnly+Secure+SameSite=Lax cookies ✅, CORS allowlist ✅, security headers ✅, per-route rate limiting ✅, password composition policy ✅ (added 2026-08-16), request body size cap + unknown-JSON-field rejection ✅ (added 2026-08-16). SQL injection was audited 2026-08-16 and found already structurally prevented (100% sqlc-generated, pgx-parameterized queries) — no changes needed.
 
 ## Password hashing
 
-Use **Argon2id**.
+Use **Argon2id**. `pkg/hash`: `m=64MB, t=3, p=2`, 16-byte `crypto/rand` salt, 32-byte key,
+PHC string format, constant-time (`subtle.ConstantTimeCompare`) verification — comfortably
+above OWASP minimums, unchanged since first implemented.
 
 Never:
 
@@ -1029,6 +1074,31 @@ Never:
 - use fast hashes such as SHA-256 directly for passwords
 
 Use a vetted Argon2id implementation with deliberately configured memory, iterations, and parallelism.
+
+### Password policy (added 2026-08-16)
+
+12–72 bytes, and must contain at least one uppercase letter, one lowercase letter, one
+digit, and one special character (`internal/utils/validate.Password`). Deliberately
+composition-based rather than a common-password/breach-list check — a local embedded
+blocklist was considered and could still be added later, but the user chose composition
+rules for this pass.
+
+### Input hardening (added 2026-08-16)
+
+- Email: length-capped at 254 bytes (RFC 5321); rejects the RFC 5322
+  `"Display Name <addr>"` form (`net/mail.ParseAddress` accepts it, so the parsed address
+  is compared back against the full input to ensure only a bare address was given).
+- All free-text profile fields (name, company name, description, custom social-link
+  labels) reject invalid UTF-8, control characters, and Unicode bidirectional-override
+  characters (the "Trojan Source" attack class) — `description` is the one field that
+  allows a bare `\n` for paragraph breaks.
+- Every JSON request body is decoded via `response.DecodeJSON`, which calls
+  `DisallowUnknownFields()` — an unrecognized field is now 400 `INVALID_BODY`, not
+  silently ignored.
+- Every request body is capped at 1MB via `middleware.MaxBody`, applied globally — scoped
+  to today's text-only JSON routes; future file uploads are expected to go through a
+  presigned R2 URL directly, never through this server, so this cap doesn't need revisiting
+  for that.
 
 ## Tokens
 
@@ -1129,26 +1199,90 @@ Never log:
 
 ---
 
-# 32. Account Deletion ⬜ TODO — note: `users.deleted_at` soft-delete column exists
+# 32. Account Deletion ✅ DONE (2026-08-16) — `DELETE /api/v1/me`; RequireAuth + 5/15min rate limit → `UserService.DeleteAccount(userID, sessionID, currentPassword)` → soft-delete (`users.deleted_at = now()`) + revoke every session → clear cookies → 204
 
 ```http
 DELETE /api/v1/me
 ```
 
-Requires authentication and explicit confirmation.
+Requires authentication. Request body:
 
-Recommended behavior:
+```json
+{
+  "current_password": "..."
+}
+```
 
-1. Re-authenticate or require recent authentication.
-2. Revoke sessions.
-3. Disable authentication.
-4. Mark account deleted or follow the product's data-retention policy.
-5. Queue deletion/anonymization of associated data where required.
-6. Record the security event.
+`current_password` is required and verified only if the account has a password identity
+(`ErrInvalidCredentials` on mismatch) — an OAuth-only account has nothing to verify it
+against, so the field is ignored and deletion proceeds on being authenticated alone.
+
+Behavior, as implemented (deliberate divergence from the spec draft above — see rationale
+below):
+
+1. If the account has a password identity, verify `current_password` first (a confirmation
+   step for this irreversible action, mirroring `POST /api/v1/me/password/change`'s shape).
+2. Soft-delete: set `users.deleted_at = now()`. Every other query in this codebase already
+   filters `WHERE deleted_at IS NULL`, so the account instantly disappears from login,
+   `GET /api/v1/me`, and every other lookup.
+3. Revoke every active session (`RevokeAllSessionsForUser` + the Redis-backed
+   `SessionRevoker`, same as `LogoutAll`).
+4. Clear the auth cookies and respond `204`.
+
+**Not implemented from the original draft, deliberately**: "re-authenticate or require
+*recent* authentication" (step 1 above uses password re-entry as the confirmation gate
+instead — recency-based re-auth is §33's concern, not yet built); "queue
+deletion/anonymization of associated data" (no products/purchases/payment data exist yet
+for this to apply to — nothing to anonymize); "record the security event" (belongs to the
+audit-events cross-cutting pass, not yet built, see §31).
+
+**Retention decision (2026-08-16, product decision, not in the original draft)**:
+`users.email` remains a permanent `UNIQUE` constraint — deliberately never relaxed to a
+partial index scoped to non-deleted rows — so a deleted account's email is retained
+indefinitely (for record-keeping/possible contact). The consequence: a deleted account's
+email can never be claimed by a *different* new account. Instead, `Register` with a
+previously-deleted account's email is treated as an intentional **reactivation** of that
+same account — see the new §6.1.2 below. This is the mechanism that makes "the email
+becomes usable again" true from the user's perspective without actually freeing the
+`UNIQUE` constraint or purging the row.
 
 Do not immediately destroy records that are legally required for financial/accounting purposes.
 
 Payment/order retention requirements should be handled separately from authentication.
+
+### 32.1 Register-time reactivation (added 2026-08-16, not in the original spec)
+
+`Register`'s existing-email check now uses a variant that also sees soft-deleted rows
+(`GetUserByEmailIncludingDeleted`, the only query in this codebase that doesn't filter
+`deleted_at`). Three outcomes instead of two:
+
+1. No row at all → create a brand-new account (unchanged).
+2. Row exists, not deleted → attach a password identity to it if none exists yet, or
+   reject with `EMAIL_ALREADY_EXISTS` if one does (unchanged, §6.1's existing behavior).
+3. **Row exists, deleted** → reactivate: clear `deleted_at`, set the password identity to
+   the password just submitted (updating the hash if a password identity already existed
+   from before deletion, or creating one if the account had been OAuth-only), and sign the
+   caller in. Same account ID, same history — this is a restoration, not a new account.
+
+### 32.2 Bug found and fixed while implementing this (2026-08-16)
+
+`Login` authenticates via `auth_identities` — a table account deletion never touches —
+*before* ever reading from `users`. That means a correct password still verifies
+successfully for a deleted account; only the final `GetUserByID` call (which does filter
+`deleted_at`) fails. That call's error used to propagate raw, which meant a deleted
+account's login attempt returned a distinguishable `404 USER_NOT_FOUND` instead of the
+generic `401 INVALID_CREDENTIALS` every other login failure returns — breaking §8's
+enumeration defense for exactly the accounts where it would matter most (confirming an
+email was once registered, then deleted). Fixed: that specific `ErrUserNotFound` is now
+translated to `ErrInvalidCredentials`, same as every other Login failure path.
+`VerifyEmail` and `ResetPassword` had a related but distinct gap — neither reads `users`
+at all today, so a verification/reset token issued before an account was deleted would
+still succeed after deletion. Both gained an explicit `GetUserByID` guard right after the
+token's expiry/used-at checks, translating `ErrUserNotFound` → `ErrTokenInvalid`.
+`GoogleCallback` has the same latent `GetUserByID` gap for a deleted account's existing
+`google` identity, left unfixed — it never exposes a distinguishable error to the client
+(always a generic `?error=oauth_failed` redirect either way), so there's no enumeration
+leak, only a minor "logs at Error level for an expected case" nit.
 
 ---
 
@@ -1220,12 +1354,12 @@ Do not change the email merely because the user submits it.
 POST /api/v1/auth/register           ✅ wired; JWT + refresh cookies on success
 POST /api/v1/auth/login              ✅ wired; JWT + refresh cookies on success
 POST /api/v1/auth/refresh            ✅ wired; rotates refresh token, issues new JWT
-POST /api/v1/auth/password/reset/request    ⬜
-POST /api/v1/auth/password/reset/confirm    ⬜
-POST /api/v1/auth/email/verification/request ⬜
-POST /api/v1/auth/email/verification/verify  ⬜
-GET  /api/v1/auth/google             ⬜
-GET  /api/v1/auth/google/callback    ⬜
+POST /api/v1/auth/password/reset/request    ✅ wired; 5/hour rate limit; generic 200 always
+POST /api/v1/auth/password/reset/confirm    ✅ wired; 10/15min rate limit; 204
+POST /api/v1/auth/email/verification/request ✅ wired; 5/hour rate limit; generic 200 always
+POST /api/v1/auth/email/verification/verify  ✅ wired; 10/15min rate limit; 200 {"data":{...}}
+GET  /api/v1/auth/google             ✅ wired; 10/15min rate limit; redirects to Google
+GET  /api/v1/auth/google/callback    ✅ wired; 10/15min rate limit; redirects to FRONTEND_URL
 ```
 
 ## Authenticated
@@ -1234,10 +1368,12 @@ GET  /api/v1/auth/google/callback    ⬜
 POST /api/v1/auth/logout             ✅ wired; 10/15min rate limit + RequireAuth; 204
 POST /api/v1/auth/logout-all         ✅ wired; 5/15min rate limit + RequireAuth; 204
 GET  /api/v1/me                      ✅ wired; 60/15min rate limit + RequireAuth; 200 {"data":{...}}
+PATCH /api/v1/me/profile             ✅ wired; 20/15min rate limit + RequireAuth; 200 {"data":{...}} (added 2026-08-16, see §6.1.1)
 POST /api/v1/me/password/change      ✅ wired; 5/15min rate limit + RequireAuth; 204
-DELETE /api/v1/me                    ⬜
-POST /api/v1/me/auth-identities/google/link   ⬜
-DELETE /api/v1/me/auth-identities/google      ⬜
+POST /api/v1/me/password/set         ✅ wired; 5/15min rate limit + RequireAuth; 204 (added 2026-08-16, see §6.1.1)
+DELETE /api/v1/me                    ✅ wired; 5/15min rate limit + RequireAuth; 204 (added 2026-08-16, see §32)
+POST /api/v1/me/auth-identities/google/link   ⬜ deprioritized 2026-08-16
+DELETE /api/v1/me/auth-identities/google      ⬜ deprioritized 2026-08-16
 ```
 
 Potential future endpoints:
@@ -1381,7 +1517,7 @@ Redirect to application
 
 ---
 
-# 40. Request Processing Pipeline 🟡 PARTIAL — CORS ✅, security headers ✅, rate limiting ✅, authentication middleware ✅ (all in `internal/middleware/`, wired in `internal/router/router.go`). Still missing: request ID, panic recovery, structured logging, authorization middleware
+# 40. Request Processing Pipeline 🟡 PARTIAL — CORS ✅, security headers ✅, rate limiting ✅, authentication middleware ✅, request ID ✅, structured logging ✅, request body size cap ✅ (all in `internal/middleware/`, wired in `internal/router/router.go` as `RequestLogger → SecurityHeaders → CORS → MaxBody → mux`). Still missing: panic recovery (audited 2026-08-16, no live/reachable panic found — this is defense-in-depth, not a bugfix), authorization middleware (blocked on protected resources existing — no products yet)
 
 Every API request should conceptually pass through:
 

@@ -71,12 +71,15 @@ type Session struct {
 type User struct {
 	ID              uuid.UUID          `json:"id"`
 	Email           string             `json:"email"`
-	Name            string             `json:"name"`
+	Name            pgtype.Text        `json:"name"`
 	AvatarUrl       pgtype.Text        `json:"avatar_url"`
 	EmailVerifiedAt pgtype.Timestamptz `json:"email_verified_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	DeletedAt       pgtype.Timestamptz `json:"deleted_at"`
+	CompanyName     pgtype.Text        `json:"company_name"`
+	Description     pgtype.Text        `json:"description"`
+	SocialLinks     []byte             `json:"social_links"`
 }
 
 type UserSubscription struct {
