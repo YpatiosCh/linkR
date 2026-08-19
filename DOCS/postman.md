@@ -8,32 +8,49 @@ especially focused on answering: **did an email actually get sent?**
 
 ## 1. Prerequisites
 
-1. Start Postgres and Redis (session revocation + rate limiting need Redis too):
+1. Configure `.env` (copy from `.env.example` if you haven't already).
+   `DATABASE_URL`, `JWT_SECRET`, and `RESEND_API_KEY` are all required — the
+   server fails to start if any are unset (`config.Load` in `config/config.go`).
+   Use a real Resend key and set `EMAIL_FROM=onboarding@resend.dev` (Resend's
+   built-in sandbox sender — no domain verification needed) to send through
+   Resend for real. `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_REDIRECT_URL`
+   are also required at startup (see the `.env.example` comments) — from a
+   Google Cloud Console OAuth client with
+   `http://localhost:8080/api/v1/auth/google/callback` registered as an
+   authorized redirect URI. `LOG_LEVEL` (`debug`/`info`/`warn`/`error`,
+   default `info`) controls log verbosity; `APP_ENV` (default `development`)
+   controls log format (JSON in `production`, human-readable text otherwise).
+
+2. Get the server running — **pick one** of these two paths, don't mix them
+   (both bind port 8080, so running both at once fails):
+
+   **Option A — full Docker Compose (simplest, no local Go toolchain needed):**
    ```bash
-   docker-compose up -d
+   docker compose up -d
    ```
-2. Apply migrations (goose is installed locally but not wired into `go.mod` —
-   run it directly):
+   This builds and starts `postgres`, `redis`, *and* the `app` container
+   together. `docker-entrypoint.sh` runs `goose ... up` automatically before
+   starting the server — migrations are applied for you, no separate step.
+   `app` reads `DATABASE_URL`/`REDIS_ADDR` pointed at the compose network's
+   service hostnames (overridden in `docker-compose.yml`), everything else
+   from your `.env`. Check `docker compose logs -f app` for the
+   `connected to database`/`server listening` lines.
+
+   **Option B — local dev loop (only Postgres/Redis containerized, run the
+   Go server natively — faster iteration while editing code):**
    ```bash
+   docker compose up -d postgres redis
    goose -dir internal/db/migrations postgres \
      "postgres://app:app@localhost:5433/digital_delivery?sslmode=disable" up
-   ```
-3. Configure `.env` (copy from `.env.example` if you haven't already).
-   `RESEND_API_KEY` is required — the server fails to start if it's unset
-   (`cmd/server/main.go`). Use a real key and set
-   `EMAIL_FROM=onboarding@resend.dev` (Resend's built-in sandbox sender — no
-   domain verification needed) to send through Resend for real.
-   `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_REDIRECT_URL` are also
-   required at startup (see the `.env.example` comments) — from a Google
-   Cloud Console OAuth client with `http://localhost:8080/api/v1/auth/google/callback`
-   registered as an authorized redirect URI.
-4. Run the server:
-   ```bash
    go run ./cmd/server
    ```
-   You should see `connected to database` and `server listening` in the logs
-   (JSON in production, human-readable text otherwise — controlled by
-   `APP_ENV`/`LOG_LEVEL`).
+   Migrations aren't automatic here — that's `docker-entrypoint.sh`'s job,
+   which only runs inside the `app` container — so run `goose` yourself
+   whenever a new migration lands (goose is a build-time-only tool, installed
+   independently of this repo's `go.mod`; `go install github.com/pressly/goose/v3/cmd/goose@latest`
+   if you don't have it). You should see `connected to database` and
+   `server listening` in the logs (JSON in production, human-readable text
+   otherwise — controlled by `APP_ENV`/`LOG_LEVEL`, as above).
 
 ## 2. Import the collection
 
