@@ -1235,10 +1235,10 @@ below):
 
 **Not implemented from the original draft, deliberately**: "re-authenticate or require
 *recent* authentication" (step 1 above uses password re-entry as the confirmation gate
-instead — recency-based re-auth is §33's concern, not yet built); "queue
+instead — session-recency-based re-auth was considered and skipped); "queue
 deletion/anonymization of associated data" (no products/purchases/payment data exist yet
-for this to apply to — nothing to anonymize); "record the security event" (belongs to the
-audit-events cross-cutting pass, not yet built, see §31).
+for this to apply to — nothing to anonymize); "record the security event" (now built —
+see §31 and `AuditAccountDeleted`).
 
 **Retention decision (2026-08-16, product decision, not in the original draft)**:
 `users.email` remains a permanent `UNIQUE` constraint — deliberately never relaxed to a
@@ -1287,36 +1287,6 @@ token's expiry/used-at checks, translating `ErrUserNotFound` → `ErrTokenInvali
 `google` identity, left unfixed — it never exposes a distinguishable error to the client
 (always a generic `?error=oauth_failed` redirect either way), so there's no enumeration
 leak, only a minor "logs at Error level for an expected case" nit.
-
----
-
-# 33. Sensitive Operations and Recent Authentication ⬜ TODO — note: `sessions.last_used_at` column exists for this
-
-Some actions should require recent authentication even when the user has a valid session.
-
-Examples:
-
-- change password
-- change email
-- delete account
-- unlink the only authentication provider
-- change security settings
-
-Possible implementation:
-
-```text
-last_authenticated_at
-```
-
-in the session.
-
-Then:
-
-```text
-RequireRecentAuthentication(15 minutes)
-```
-
-or require the current password/OAuth reauthentication depending on the operation.
 
 ---
 
@@ -1794,7 +1764,6 @@ Build authentication in this order:
 20. ⬜ Password reset
 21. ✅ Password change
 22. ⬜ Account deletion
-23. ⬜ Recent-authentication checks
 24. ✅ Audit events
 25. ✅ Rate limiting
 

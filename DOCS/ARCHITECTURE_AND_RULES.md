@@ -1183,19 +1183,16 @@ Snapshot as of 2026-08-19 (audit events + per-account email-keyed login rate lim
 3. ~~**Audit events**~~ — done (2026-08-19), see `AuditRecorder` under the Service layer
    above (18-event taxonomy, `internal/models/audit_event.go`) — one cross-cutting pass
    wiring `audit_events` writes into every existing endpoint (Register, Login — including
-   the login-attempt-limiter's `LOGIN_RATE_LIMITED` event, the overlap with #2 mentioned
-   below when this item was still pending — Logout, LogoutAll, ChangePassword, SetPassword,
-   UpdateProfile, DeleteAccount, the verification/reset/Google flows), not bolted onto one
-   feature at a time.
+   the login-attempt-limiter's `LOGIN_RATE_LIMITED` event — Logout, LogoutAll,
+   ChangePassword, SetPassword, UpdateProfile, DeleteAccount, the verification/reset/Google
+   flows), not bolted onto one feature at a time.
 
 **After the three above:**
 
-4. **Sensitive operations / recent authentication** (auth spec §33) — needs a definition of
-   what counts as "sensitive" and how "recent" a login must be before this is actionable
-5. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
-6. **Google account linking/unlinking** — the explicit self-service endpoints from §18;
+4. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
+5. **Google account linking/unlinking** — the explicit self-service endpoints from §18;
    deprioritized by the user as not urgent
-7. **New-device/new-location login alerts** — deliberately deferred; see the "Not yet
+6. **New-device/new-location login alerts** — deliberately deferred; see the "Not yet
    implemented" entry above and `DOCS/PRODUCT_VISION.md` §11 for the reasoning
 
 ---
