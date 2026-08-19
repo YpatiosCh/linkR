@@ -288,7 +288,7 @@ don't have to relitigate them:
 | 2 | Delivery mechanics: on-platform download page vs. emailed link; download-link expiry rules | **OPEN** | product |
 | 3 | Buyer identity: full account vs. email + signed download token for first purchase | **OPEN** | product |
 | 4 | Per-file-type storage/size nuances (any-digital ⇒ arbitrary formats) | **OPEN** | product |
-| 5 | Register response: adopt generic `201` + inbox-differentiated email to close the account-enumeration gap (auth spec §6.1 flags this) | **OPEN — recommend closing** | auth |
+| 5 | Register response: adopt generic `201` + inbox-differentiated email to close the account-enumeration gap (auth spec §6.1 flags this) | **DECIDED (2026-08-19) — keep `409 EMAIL_ALREADY_EXISTS`.** A truly generic response isn't free here: Register auto-issues a real session on success, so a duplicate-account response either has to skip session issuance (leaks via `Set-Cookie` presence to a determined attacker) or defer all Register sessions behind mandatory email verification (a real UX/architecture change for every signup). Not worth it for the marginal protection gained. | auth |
 | 6 | Fee resolution + privileged actions during a stale downgrade window: confirm these read the subscription record, not the JWT `plan_key` | **OPEN — recommend confirming** | plans |
 
 ---
