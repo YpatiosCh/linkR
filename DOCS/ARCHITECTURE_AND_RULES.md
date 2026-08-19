@@ -724,7 +724,7 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic recovery middleware, on top of: account deletion + reactivation; structured logging pipeline; two-phase registration + seller profile system; password/input validation hardening + self-service `SetPassword`; Google OAuth login/signup + email verification + password reset + Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
+Snapshot as of 2026-08-19 (audit events + per-account email-keyed login rate limiting + panic recovery middleware — clearing the full pre-plans priority set in one session, on top of: account deletion + reactivation; structured logging pipeline; two-phase registration + seller profile system; password/input validation hardening + self-service `SetPassword`; Google OAuth login/signup + email verification + password reset + Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
 
 ### Implemented
 
@@ -785,7 +785,9 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
   `TokenPair` (`models/token.go` — moved out of the service package since it crosses the
   service↔handler boundary), `EmailVerificationToken`, `PasswordResetToken`,
   `UpdateProfileInput` (partial-patch input DTO — every field a pointer; nil = leave
-  unchanged). `models/social.go` — `SocialPlatform` string enum (website/x/instagram/
+  unchanged). `models/audit_event.go` — `AuditEventType` string enum (18 constants, no
+  `Valid()` — developer-controlled, never user input) + `AuditEvent{ID, UserID *uuid.UUID,
+  EventType, IPAddress *string, UserAgent *string, Metadata map[string]any, CreatedAt}`. `models/social.go` — `SocialPlatform` string enum (website/x/instagram/
   youtube/tiktok/discord/github/linkedin) with `Valid()`, mirroring the existing `PLAN`
   enum style; `SocialLinks{Platforms map[SocialPlatform]string, Other []CustomSocialLink}` —
   `Platforms` keys are validated against the closed enum (rejects typos like "diskord"
@@ -806,7 +808,7 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
   `SocialLinks`, and **`HasPassword bool`** (not omitempty — the frontend needs to reliably
   tell "false" from "field absent" to decide whether to show "set a password" or "change
   password"), MePlanResponse, MessageResponse).
-- **Repository layer**: `RepoManager` + 6 entity repositories, `WithinTx` + context-injected
+- **Repository layer**: `RepoManager` + 7 entity repositories, `WithinTx` + context-injected
   transactions, `dbXToDomain` mappers (now return `(models.User, error)` — an
   unmarshal failure on the `SocialLinks` JSONB column is a real error, not silently
   swallowed). `AuthIdentityRepository` includes
@@ -819,7 +821,12 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
   **`Reactivate`** for account deletion/reactivation. `EmailVerificationTokenRepository` and
   `PasswordResetTokenRepository` (`Create`/`GetByHash`/`MarkConsumed` each) mirror
   `SessionRepository`'s "return any row including used ones, let the service decide"
-  pattern for `GetByHash`.
+  pattern for `GetByHash`. `AuditEventRepository` (`CreateAuditEvent` — the only method;
+  an append-only log has no update/mark-consumed operation) JSON-marshals `Metadata` before
+  insert and unmarshals it back in `dbAuditEventToDomain`, mirroring how `UserRepository`
+  handles `SocialLinks`; adds a small `uuidOrNull(*uuid.UUID) pgtype.UUID` helper alongside
+  the existing `textOrNull`, since `audit_events.user_id` is the first nullable UUID FK in
+  this schema.
 - **Service layer**: `ServiceManager` + `AuthService` + `UserService` + `EmailService`
   (`AuthService`/`UserService` split — profile operations don't live on `AuthService`;
   `VerifyEmail`/`RequestPasswordReset`/`ResetPassword` live on `AuthService`, not
@@ -946,6 +953,36 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
     `ServiceManager.NewServiceManager` with a 5-attempts/15-minute limit (tighter than the
     IP limit since it targets one account, matching the 5/15min used elsewhere for
     account-sensitive actions) and passed to `AuthService`.
+  - `AuditRecorder` (`Record(ctx, eventType, userID *uuid.UUID, metadata map[string]any)`,
+    no error return) — persists a row to `audit_events` for every security/account-relevant
+    action across `AuthService`/`UserService`. **Fire-and-forget by design**: a write failure
+    is logged at `Error` (via `logctx.FromContext`, from inside `internal/service/audit_service.go`)
+    and swallowed, never propagated, so an audit-table outage can never block or fail the
+    action being audited — this is a third, deliberate exception to Rule O1 alongside the
+    two already listed there (the two OAuth handlers, and startup/shutdown logging):
+    audit-write failures never reach the HTTP boundary since `Record` has nothing to
+    propagate to, so `audit_service.go` is the only place they can be logged instead of
+    silently lost (Rule D3). Reads IP/User-Agent/request ID from `ctx` via the new
+    `internal/utils/reqctx` package (mirrors `logctx`'s context-propagation pattern exactly;
+    populated once by `RequestLogger`, see Middleware below) and merges the request ID into
+    `metadata["request_id"]` automatically so every row correlates with its structured log
+    line — callers never pass IP/UA/request-ID explicitly. Calls happen as post-commit work
+    (same slot as `issueTokenPair`/`sessions.RevokeSession(s)` calls), never inside an
+    existing `WithinTx`, since `Record` never returns an error there's nothing to entangle
+    with transaction rollback. Not part of the public `Service` aggregate (no `Service.Audit()`)
+    — mirrors `SessionRevoker`/`LoginAttemptLimiter`/`GoogleOAuthClient`: a plain
+    constructor-dependency interface, nothing outside `AuthService`/`UserService` calls it.
+    Satisfied by `*auditService` (`internal/service/audit_service.go`), backed by the new
+    `AuditEventRepository` (`internal/repository/audit_event_repository.go`, one
+    `CreateAuditEvent` method — an append-only log has no update/mark-consumed operation)
+    and `models.AuditEvent`/`models.AuditEventType` (`internal/models/audit_event.go`).
+    Event taxonomy (18 constants, `AuditUserRegistered` through `AuditAccountDeleted`) covers
+    every auth/user flow except `Refresh`'s *ordinary* rotation (too noisy — only
+    `AuditRefreshTokenReuseDetected` fires) and `GoogleAuthURL`/`GetMe` (reads/no state
+    change); `USER_REGISTERED` is shared by the password-`Register` and Google-signup
+    "brand new account" branches, distinguished by `metadata["provider"]`. Constructed once
+    in `ServiceManager.NewServiceManager` from `repos.AuditEvent()` and passed to both
+    `AuthService` and `UserService`.
 - **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll/
   RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/
   GoogleCallback) + `UserHandler`
@@ -1001,14 +1038,17 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
     (multi-instance safe) or a Postgres query (adds real DB load to every request).
   - `cors.go` — `CORS(allowedOrigins)`: explicit allowlist, echoes origin (never `*`), `Vary: Origin`, preflight 204
   - `securityheaders.go` — `SecurityHeaders(appEnv)`: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, `default-src 'none'` CSP, HSTS (production only)
-  - `requestlog.go` — `RequestLogger(base *slog.Logger)`: assigns each request a `uuid.NewString()` request ID, sets it on the `X-Request-ID` response header, injects a logger enriched with it (`base.With("request_id", id)`) into the request context via `internal/utils/logctx`, wraps the response writer in an unexported `statusRecorder` to capture the status code, and logs one `Info` "http request" line per request (method/path/status/duration_ms) after it completes. `LoggerFromContext(r) *slog.Logger` is the handler-facing accessor (mirrors `AuthClaims(r)`), never nil (falls back to `slog.Default()` outside the middleware chain). Must be the outermost global middleware so it observes every request, including CORS preflights and unmatched routes, and the request ID exists before anything else runs.
+  - `requestlog.go` — `RequestLogger(base *slog.Logger)`: assigns each request a `uuid.NewString()` request ID, sets it on the `X-Request-ID` response header, injects a logger enriched with it (`base.With("request_id", id)`) into the request context via `internal/utils/logctx`, **also injects a `reqctx.Meta{IP, UserAgent, RequestID}` into the same context via `internal/utils/reqctx`** (the same request ID, plus `reqctx.ClientIP(r)` and the raw `User-Agent` header — consumed today by `AuditRecorder`, so audit logging needs zero handler-file changes), wraps the response writer in an unexported `statusRecorder` to capture the status code, and logs one `Info` "http request" line per request (method/path/status/duration_ms) after it completes. `LoggerFromContext(r) *slog.Logger` is the handler-facing accessor (mirrors `AuthClaims(r)`), never nil (falls back to `slog.Default()` outside the middleware chain). Must be the outermost global middleware so it observes every request, including CORS preflights and unmatched routes, and the request ID exists before anything else runs.
   - `recover.go` — `Recover()`: recovers any panic from a downstream handler, logs it at `Error` level (panic value + `runtime/debug.Stack()`) via the request-scoped logger (`logctx.FromContext`), and responds `500 INTERNAL_ERROR` via the existing `response.Error`/`response.CodeInternalError` instead of dropping the connection with an unstructured stderr trace (net/http's default per-connection recovery). Sits directly inside `RequestLogger` in the global chain — after `RequestLogger` so the request ID/logger are already in context when a panic is caught, and before everything else so `RequestLogger`'s deferred access-log line still observes the resulting 500 status.
   - `maxbody.go` — `MaxBody(limit int64)`: wraps `r.Body` in `http.MaxBytesReader(w, r.Body, limit)`. `MaxRequestBodyBytes = 1MB` — generous for today's text-only JSON API; scoped only to today's routes, not a blanket rule — product file uploads (once built) will go through a presigned R2 PUT URL directly, never through this server's handlers, so this cap never needs revisiting for that. A body over the limit surfaces as a normal JSON decode error (400 `INVALID_BODY` via `response.DecodeJSON`), not a distinct status — deliberate simplicity, not an oversight.
 - **Rate limiting** (`internal/redis/ratelimit.go`, not `internal/middleware/` — see
   `internal/redis` above): `NewRateLimiter(client, name, limit, window)` — per-IP fixed-window
   middleware, `INCR` + `EXPIRE`-on-first-hit against Redis, shared across every instance.
   `name` namespaces the counter per route (`ratelimit:{name}:{ip}`) since the counter store
-  is shared now rather than one isolated Go map per call site.
+  is shared now rather than one isolated Go map per call site. IP extraction (`X-Real-IP`,
+  falling back to `RemoteAddr` with the port stripped) now lives in `reqctx.ClientIP`
+  (`internal/utils/reqctx`) rather than a package-local `clientIP` — promoted out so
+  `RequestLogger` could share it too (Rule G4), `NewRateLimiter` just calls the shared function.
 - **Router** (`internal/router/router.go`): `SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler` —
   builds `requireAuth`/the rate-limiter factory from `cfg.RedisClient` (unchanged signature —
   the client travels on `cfg`, which `SetupRoutes` already receives), wires per-route
@@ -1077,13 +1117,15 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
   `me-password-change`/`me-password-set` since it's the same class of sensitive,
   confirmation-gated action.)
 - **Tests** (under root `test/`, per §3.9/Q6):
-  - `test/service/auth_service_test.go` — Register (success/email-exists/invalid-input/attach-password-to-existing-google-account/**reactivates-deleted-account-with-existing-password/reactivates-deleted-account-was-oauth-only**), Login (success/4 invalid paths/**deleted-account → generic ErrInvalidCredentials, not a leaked 404**), Refresh (success/reuse/expired), Logout, LogoutAll, RequestEmailVerification (success/unknown-email/already-verified), VerifyEmail (success/not-found/expired/already-used/**deleted-account → ErrTokenInvalid**), RequestPasswordReset (success/unknown-email), ResetPassword (success/token-invalid/token-already-used/oauth-only/weak-password/**deleted-account → ErrTokenInvalid**), GoogleAuthURL (success), GoogleCallback (existing-google-user/attach-to-existing-password-account/new-user/email-not-verified/exchange-failure/userinfo-fetch-failure) — plus the shared `fakeRepo`/`fakeUserRepo`/`fakeIdentityRepo`/`fakeSessionRepo`/`fakeSubscriptionRepo`/`fakeEmailVerificationTokenRepo`/`fakePasswordResetTokenRepo`/`fakeEmailService`/`fakeGoogleOAuthClient`/`newTestAuthService` fixtures used across all service test files (`fakeUserRepo.GetUserByID` now defaults to "found, not deleted" when its `getByID` field is unset, so pre-existing tests that never configured it don't panic against the new deleted-account guards)
-  - `test/service/user_service_test.go` — GetMe (success/not-found/has-password reflects identity state), ChangePassword (success/invalid-creds/oauth-only/weak-password), SetPassword (success/already-set/weak-password), UpdateProfile (success per field/each validation failure/partial-patch leaves other fields untouched), **DeleteAccount (success-with-password/success-oauth-only/wrong-password)**
+  - `test/service/auth_service_test.go` — Register (success/email-exists/invalid-input/attach-password-to-existing-google-account/**reactivates-deleted-account-with-existing-password/reactivates-deleted-account-was-oauth-only**), Login (success/4 invalid paths/**deleted-account → generic ErrInvalidCredentials, not a leaked 404**/**too-many-attempts/keyed-on-normalized-email/limiter-error-propagates**), Refresh (success — asserts **no** audit event/reuse/expired), Logout, LogoutAll, RequestEmailVerification (success/unknown-email/already-verified), VerifyEmail (success/not-found/expired/already-used/**deleted-account → ErrTokenInvalid**), RequestPasswordReset (success/unknown-email), ResetPassword (success/token-invalid/token-already-used/oauth-only/weak-password/**deleted-account → ErrTokenInvalid**), GoogleAuthURL (success), GoogleCallback (existing-google-user/attach-to-existing-password-account/new-user/email-not-verified/exchange-failure/userinfo-fetch-failure) — plus the shared `fakeRepo`/`fakeUserRepo`/`fakeIdentityRepo`/`fakeSessionRepo`/`fakeSubscriptionRepo`/`fakeEmailVerificationTokenRepo`/`fakePasswordResetTokenRepo`/`fakeEmailService`/`fakeGoogleOAuthClient`/`fakeSessionRevoker`/`fakeLoginAttemptLimiter`/**`fakeAuditRecorder`**/`newTestAuthService` fixtures used across all service test files (`fakeUserRepo.GetUserByID` now defaults to "found, not deleted" when its `getByID` field is unset, so pre-existing tests that never configured it don't panic against the new deleted-account guards). Almost every success/failure case above also asserts the exact `AuditEventType`/`userID`/metadata `fakeAuditRecorder` was called with (or `callCount == 0` for the flows that deliberately record nothing — silent no-ops, malformed input caught before any real attempt, ordinary Refresh).
+  - `test/service/user_service_test.go` — GetMe (success/not-found/has-password reflects identity state), ChangePassword (success — **asserts `AuditPasswordChanged`**/invalid-creds/oauth-only/weak-password), SetPassword (success — **asserts `AuditPasswordSet`**/already-set/weak-password), UpdateProfile (success per field — **asserts `AuditProfileUpdated` with `metadata["changed_fields"]`**/each validation failure/partial-patch leaves other fields untouched), **DeleteAccount (success-with-password — asserts `AuditAccountDeleted`/success-oauth-only/wrong-password)**
+  - `test/service/audit_service_test.go` — `Record` populates IP/User-Agent/request-ID from `reqctx` and merges `request_id` into metadata, nil `userID`/metadata are handled, a repo write failure is logged (asserted against a `slog.NewJSONHandler` buffer) and swallowed rather than panicking or blocking the caller
   - `test/service/email_service_test.go` — SendVerificationEmail/SendPasswordResetEmail (success + non-2xx) against a fake `http.RoundTripper`, no network access
   - `test/handlers/auth_handler_test.go` — Register/Login/Refresh/Logout/LogoutAll/RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/GoogleCallback (happy paths + key error paths, incl. unknown-JSON-field rejection); `redirectLocation` is the helper for asserting `Location` headers on the two redirect-based endpoints
   - `test/handlers/user_handler_test.go` — GetMe/ChangePassword/SetPassword/UpdateProfile (happy paths + key error paths, incl. the Discord-typo/too-many-custom-links 400s)
-  - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer/revoked-session/revocation-check-error), AuthClaims outside protected route, `RequestLogger` (request-ID header/access-log line/context propagation/status default), `MaxBody` (under/over limit)
-  - `test/redis` — `SessionRevocationStore` (not-revoked-by-default, single/bulk revoke), `NewRateLimiter` (allow-under-limit, reject-over-limit, per-name isolation, window reset) — all against `miniredis`, no live Redis needed for the suite
+  - `test/middleware` — RequireAuth (Bearer/cookie/precedence/missing/invalid/wrong-key/empty-Bearer/revoked-session/revocation-check-error), AuthClaims outside protected route, `RequestLogger` (request-ID header/access-log line/context propagation/status default), `Recover` (panic → 500/log line/composed-with-RequestLogger), `MaxBody` (under/over limit)
+  - `test/reqctx` — `WithMeta`/`FromContext` roundtrip, zero-value outside any injected context, `ClientIP` header-vs-`RemoteAddr` precedence
+  - `test/redis` — `SessionRevocationStore` (not-revoked-by-default, single/bulk revoke), `NewRateLimiter` (allow-under-limit, reject-over-limit, per-name isolation, window reset), `LoginAttemptLimiter` (allow-under-limit, reject-over-limit, per-email isolation, window reset) — all against `miniredis`, no live Redis needed for the suite
   - `test/jwttoken` — Issue/Verify roundtrip, wrong key, tampered, malformed, alg:none, duration constant, distinct tokens
   - `test/oauthstate` — Sign/Verify roundtrip, wrong secret, mismatched query state, tampered signature, malformed cookie value, SetCookie/ClearCookie attributes
   - `test/response` — `HandleError` (mapped/unmapped, Warn-vs-Error log level split), `DecodeJSON` (valid/unknown-field/malformed)
@@ -1094,7 +1136,10 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
   `utils/token` (opaque token + SHA-256), `utils/validate`, `utils/response` (envelope, codes,
   `errorStatusMap`, `HandleError`, `DecodeJSON`), `utils/jwttoken`, `utils/cookies` (auth
   cookie set/clear), `utils/oauthstate` (signed OAuth CSRF state cookie), `utils/logctx`
-  (request-scoped logger context propagation), `msgs` sentinel errors — verification/reset
+  (request-scoped logger context propagation), `utils/reqctx` (request-scoped
+  IP/User-Agent/request-ID context propagation, same pattern as `logctx`; also home of
+  `ClientIP(r)`, promoted out of `internal/redis/ratelimit.go`), `msgs` sentinel errors —
+  verification/reset
   needed no new sentinels (`ErrTokenInvalid`/`ErrTokenAlreadyUsed`/`ErrPasswordNotSet`/
   `ErrInvalidCredentials` already covered every failure mode); Google OAuth added
   `ErrOAuthEmailNotVerified`; profile updates added `ErrInvalidInput` (400, for validation
@@ -1110,9 +1155,6 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
   existing account by verified-email match, but there's no way for an authenticated user to
   add/remove a Google identity outside of that automatic path. Deprioritized by the user
   (2026-08-16) as not urgent right now.
-- Audit events (`audit_events` table exists; nothing writes to it yet — not even
-  Register/Login/the verification/reset/Google/DeleteAccount flows; deliberately deferred as
-  one cross-cutting pass across all endpoints rather than partial per-endpoint coverage)
 - Email change (account deletion — with reactivation on re-registration — landed 2026-08-16;
   see `DeleteAccount`/`reactivateAccount` above)
 - New-device/new-location login alert emails — considered and deliberately deferred; see
@@ -1138,11 +1180,13 @@ Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic r
 2. ~~**Per-account (email-keyed) rate limiting on Login**~~ — done (2026-08-19), see
    `LoginAttemptLimiter` under the Service layer above (5 attempts/15min per normalized
    email, additive to the existing 10/15min per-IP limit on the route).
-3. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
-   existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, SetPassword,
-   UpdateProfile, DeleteAccount, the verification/reset/Google flows, …), not bolted onto
-   one feature at a time. The biggest of the three — do last so the event schema can also
-   capture failed-login events from #2 if that overlap turns out to be wanted.
+3. ~~**Audit events**~~ — done (2026-08-19), see `AuditRecorder` under the Service layer
+   above (18-event taxonomy, `internal/models/audit_event.go`) — one cross-cutting pass
+   wiring `audit_events` writes into every existing endpoint (Register, Login — including
+   the login-attempt-limiter's `LOGIN_RATE_LIMITED` event, the overlap with #2 mentioned
+   below when this item was still pending — Logout, LogoutAll, ChangePassword, SetPassword,
+   UpdateProfile, DeleteAccount, the verification/reset/Google flows), not bolted onto one
+   feature at a time.
 
 **After the three above:**
 

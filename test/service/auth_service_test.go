@@ -53,12 +53,18 @@ func (f *fakeRepo) PasswordResetToken() repository.PasswordResetTokenRepository 
 	return f.passwordReset
 }
 
+// AuditEvent is never exercised through fakeRepo: AuthService/UserService
+// take an AuditRecorder directly (see fakeAuditRecorder), not through the
+// embedded repository.Repository, so this only exists to satisfy the
+// interface.
+func (f *fakeRepo) AuditEvent() repository.AuditEventRepository { return nil }
+
 // newTestAuthService builds an authService wired to repo, testCfg, and
 // no-op fakeEmailService/fakeSessionRevoker — the email-sending and
 // session-revocation behavior are only asserted by the tests that
 // construct and inspect their own fakes.
 func newTestAuthService(repo *fakeRepo) service.AuthService {
-	return service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
+	return service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, &fakeAuditRecorder{})
 }
 
 // fakeGoogleOAuthClient is a fake service.GoogleOAuthClient with optional
@@ -104,6 +110,23 @@ func (f *fakeSessionRevoker) RevokeSession(ctx context.Context, sessionID uuid.U
 func (f *fakeSessionRevoker) RevokeSessions(ctx context.Context, sessionIDs []uuid.UUID) error {
 	f.revokedSessionIDs = sessionIDs
 	return f.err
+}
+
+// fakeAuditRecorder is a spy service.AuditRecorder that records the last
+// event it was called with, plus a running count, so tests can assert
+// which (if any) audit event a flow recorded.
+type fakeAuditRecorder struct {
+	lastEventType models.AuditEventType
+	lastUserID    *uuid.UUID
+	lastMetadata  map[string]any
+	callCount     int
+}
+
+func (f *fakeAuditRecorder) Record(ctx context.Context, eventType models.AuditEventType, userID *uuid.UUID, metadata map[string]any) {
+	f.lastEventType = eventType
+	f.lastUserID = userID
+	f.lastMetadata = metadata
+	f.callCount++
 }
 
 // fakeLoginAttemptLimiter is a spy service.LoginAttemptLimiter. Allow
@@ -405,7 +428,8 @@ func TestLoginSuccess(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	svc := newTestAuthService(repo)
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 
 	// Mixed-case/padded email must be normalized before lookup.
 	user, pair, err := svc.Login(context.Background(), models.LoginInput{
@@ -426,6 +450,12 @@ func TestLoginSuccess(t *testing.T) {
 	}
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+	if recorder.lastEventType != models.AuditLoginSucceeded {
+		t.Errorf("expected AuditLoginSucceeded, got %v", recorder.lastEventType)
+	}
+	if recorder.lastUserID == nil || *recorder.lastUserID != userID {
+		t.Errorf("expected recorded userID %s, got %v", userID, recorder.lastUserID)
 	}
 }
 
@@ -453,12 +483,17 @@ func TestLoginDeletedAccount(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	_, _, err := newTestAuthService(repo).Login(context.Background(), models.LoginInput{
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	_, _, err := svc.Login(context.Background(), models.LoginInput{
 		Email:    "user@example.com",
 		Password: "Correct-Horse1!",
 	})
 	if !errors.Is(err, msgs.ErrInvalidCredentials) {
 		t.Fatalf("expected ErrInvalidCredentials for a deleted account, got %v", err)
+	}
+	if recorder.lastEventType != models.AuditLoginFailed {
+		t.Errorf("expected AuditLoginFailed, got %v", recorder.lastEventType)
 	}
 }
 
@@ -487,7 +522,7 @@ func TestLoginInvalidCredentials(t *testing.T) {
 		},
 		{
 			name:  "wrong password",
-			input: models.LoginInput{Email: "user@example.com", Password: "wrong-password"},
+			input: models.LoginInput{Email: "user@example.com", Password: "Wrong-Password1!"},
 			identity: &fakeIdentityRepo{get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
 				return passwordIdentity(t, userID, "Correct-Horse1!"), nil
 			}},
@@ -514,12 +549,24 @@ func TestLoginInvalidCredentials(t *testing.T) {
 				sub:     defaultSub(),
 			}
 
-			_, _, err := newTestAuthService(repo).Login(context.Background(), tc.input)
+			recorder := &fakeAuditRecorder{}
+			svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+			_, _, err := svc.Login(context.Background(), tc.input)
 			if !errors.Is(err, msgs.ErrInvalidCredentials) {
 				t.Fatalf("expected ErrInvalidCredentials, got %v", err)
 			}
 			if sessions.created != 0 {
 				t.Errorf("no session should be created on failed login, got %d", sessions.created)
+			}
+			// The malformed-email case fails before the limiter/identity lookup
+			// even runs, so nothing is recorded for it; every other case is a
+			// real (if failed) login attempt.
+			if tc.name == "malformed email" {
+				if recorder.callCount != 0 {
+					t.Errorf("expected no audit event for a malformed email, got %v", recorder.lastEventType)
+				}
+			} else if recorder.lastEventType != models.AuditLoginFailed {
+				t.Errorf("expected AuditLoginFailed, got %v", recorder.lastEventType)
 			}
 		})
 	}
@@ -549,7 +596,8 @@ func TestLoginTooManyAttempts(t *testing.T) {
 	limiter := &fakeLoginAttemptLimiter{allow: func(ctx context.Context, email string) (bool, error) {
 		return false, nil
 	}}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter)
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter, recorder)
 
 	_, _, err := svc.Login(context.Background(), models.LoginInput{
 		Email:    "user@example.com",
@@ -557,6 +605,9 @@ func TestLoginTooManyAttempts(t *testing.T) {
 	})
 	if !errors.Is(err, msgs.ErrTooManyLoginAttempts) {
 		t.Fatalf("expected ErrTooManyLoginAttempts, got %v", err)
+	}
+	if recorder.lastEventType != models.AuditLoginRateLimited {
+		t.Errorf("expected AuditLoginRateLimited, got %v", recorder.lastEventType)
 	}
 }
 
@@ -579,7 +630,7 @@ func TestLoginAttemptLimiterKeyedOnNormalizedEmail(t *testing.T) {
 	}
 
 	limiter := &fakeLoginAttemptLimiter{}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter, &fakeAuditRecorder{})
 
 	// Casing/whitespace variants of the same address must key the limiter
 	// identically to what the identity lookup itself normalizes to.
@@ -614,7 +665,7 @@ func TestLoginAttemptLimiterErrorPropagates(t *testing.T) {
 	limiter := &fakeLoginAttemptLimiter{allow: func(ctx context.Context, email string) (bool, error) {
 		return false, limiterErr
 	}}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter, &fakeAuditRecorder{})
 
 	_, _, err := svc.Login(context.Background(), models.LoginInput{
 		Email:    "user@example.com",
@@ -651,7 +702,8 @@ func TestRefreshSuccess(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	svc := newTestAuthService(repo)
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	_, pair, err := svc.Refresh(context.Background(), "some-raw-refresh-token")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
@@ -665,6 +717,11 @@ func TestRefreshSuccess(t *testing.T) {
 	// A new session should have been created for the rotated token.
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one new session, got %d", sessions.created)
+	}
+	// An ordinary refresh happens every ~15 minutes automatically — it must
+	// not generate an audit event (only the reuse-detection branch does).
+	if recorder.callCount != 0 {
+		t.Errorf("expected no audit event on an ordinary refresh, got %v", recorder.lastEventType)
 	}
 }
 
@@ -693,8 +750,9 @@ func TestRefreshReuseDetected(t *testing.T) {
 	revokedFamilyID := uuid.New()
 	sessions.revokedFamilyIDs = []uuid.UUID{revokedFamilyID}
 	revoker := &fakeSessionRevoker{}
+	recorder := &fakeAuditRecorder{}
 
-	_, _, err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).Refresh(context.Background(), "old-consumed-token")
+	_, _, err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder).Refresh(context.Background(), "old-consumed-token")
 	if !errors.Is(err, msgs.ErrTokenReuseDetected) {
 		t.Fatalf("expected ErrTokenReuseDetected, got %v", err)
 	}
@@ -704,6 +762,9 @@ func TestRefreshReuseDetected(t *testing.T) {
 	}
 	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedFamilyID {
 		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedFamilyID}, revoker.revokedSessionIDs)
+	}
+	if recorder.lastEventType != models.AuditRefreshTokenReuseDetected {
+		t.Errorf("expected AuditRefreshTokenReuseDetected, got %v", recorder.lastEventType)
 	}
 }
 
@@ -742,7 +803,9 @@ func TestRegisterSuccess(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "  New@Example.com ",
 		Password: "Correct-Horse1!",
 	})
@@ -763,6 +826,12 @@ func TestRegisterSuccess(t *testing.T) {
 	}
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+	if recorder.lastEventType != models.AuditUserRegistered {
+		t.Errorf("expected AuditUserRegistered, got %v", recorder.lastEventType)
+	}
+	if recorder.lastMetadata["provider"] != "password" {
+		t.Errorf("expected metadata provider=password, got %v", recorder.lastMetadata)
 	}
 }
 
@@ -816,7 +885,9 @@ func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "ada@example.com",
 		Password: "Correct-Horse1!",
 	})
@@ -834,6 +905,9 @@ func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
 	}
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+	if recorder.lastEventType != models.AuditPasswordIdentityAttached {
+		t.Errorf("expected AuditPasswordIdentityAttached, got %v", recorder.lastEventType)
 	}
 }
 
@@ -860,7 +934,9 @@ func TestRegister_ReactivatesDeletedAccount_WithExistingPassword(t *testing.T) {
 	sessions := &fakeSessionRepo{}
 	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub()}
 
-	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "ada@example.com",
 		Password: "New-Correct1!",
 	})
@@ -881,6 +957,9 @@ func TestRegister_ReactivatesDeletedAccount_WithExistingPassword(t *testing.T) {
 	}
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+	if recorder.lastEventType != models.AuditAccountReactivated {
+		t.Errorf("expected AuditAccountReactivated, got %v", recorder.lastEventType)
 	}
 }
 
@@ -904,7 +983,9 @@ func TestRegister_ReactivatesDeletedAccount_WasOAuthOnly(t *testing.T) {
 	sessions := &fakeSessionRepo{}
 	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub()}
 
-	user, pair, err := newTestAuthService(repo).Register(context.Background(), models.RegisterInput{
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "ada@example.com",
 		Password: "New-Correct1!",
 	})
@@ -923,6 +1004,9 @@ func TestRegister_ReactivatesDeletedAccount_WasOAuthOnly(t *testing.T) {
 	if pair.AccessToken == "" || pair.RawRefreshToken == "" {
 		t.Error("expected both tokens to be non-empty")
 	}
+	if recorder.lastEventType != models.AuditAccountReactivated {
+		t.Errorf("expected AuditAccountReactivated, got %v", recorder.lastEventType)
+	}
 }
 
 // --- GoogleAuthURL ---
@@ -934,7 +1018,7 @@ func TestGoogleAuthURL_Success(t *testing.T) {
 			return "https://accounts.google.com/o/oauth2/v2/auth?state=" + state
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{}, &fakeAuditRecorder{})
 
 	authURL, state, err := svc.GoogleAuthURL(context.Background())
 	if err != nil {
@@ -976,7 +1060,8 @@ func TestGoogleCallback_ExistingGoogleUser(t *testing.T) {
 			return googleInfo("google-sub-1", "ada@example.com"), nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{}, recorder)
 
 	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err != nil {
@@ -990,6 +1075,9 @@ func TestGoogleCallback_ExistingGoogleUser(t *testing.T) {
 	}
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+	if recorder.lastEventType != models.AuditGoogleLogin {
+		t.Errorf("expected AuditGoogleLogin, got %v", recorder.lastEventType)
 	}
 }
 
@@ -1014,7 +1102,8 @@ func TestGoogleCallback_AttachToExistingPasswordAccount(t *testing.T) {
 			return googleInfo("google-sub-2", "ada@example.com"), nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{}, recorder)
 
 	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err != nil {
@@ -1028,6 +1117,9 @@ func TestGoogleCallback_AttachToExistingPasswordAccount(t *testing.T) {
 	}
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
+	}
+	if recorder.lastEventType != models.AuditGoogleLinked {
+		t.Errorf("expected AuditGoogleLinked, got %v", recorder.lastEventType)
 	}
 }
 
@@ -1048,7 +1140,8 @@ func TestGoogleCallback_NewUser(t *testing.T) {
 			return googleInfo("google-sub-3", "new-google-user@example.com"), nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{}, recorder)
 
 	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err != nil {
@@ -1075,6 +1168,12 @@ func TestGoogleCallback_NewUser(t *testing.T) {
 	if sessions.created != 1 {
 		t.Errorf("expected exactly one session to be created, got %d", sessions.created)
 	}
+	if recorder.lastEventType != models.AuditUserRegistered {
+		t.Errorf("expected AuditUserRegistered, got %v", recorder.lastEventType)
+	}
+	if recorder.lastMetadata["provider"] != "google" {
+		t.Errorf("expected metadata provider=google, got %v", recorder.lastMetadata)
+	}
 }
 
 func TestGoogleCallback_EmailNotVerified(t *testing.T) {
@@ -1084,7 +1183,7 @@ func TestGoogleCallback_EmailNotVerified(t *testing.T) {
 			return service.GoogleUserInfo{Subject: "google-sub-4", Email: "unverified@example.com", EmailVerified: false}, nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{}, &fakeAuditRecorder{})
 
 	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if !errors.Is(err, msgs.ErrOAuthEmailNotVerified) {
@@ -1099,7 +1198,7 @@ func TestGoogleCallback_ExchangeFailure(t *testing.T) {
 			return "", errors.New("boom")
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{}, &fakeAuditRecorder{})
 
 	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err == nil {
@@ -1114,7 +1213,7 @@ func TestGoogleCallback_UserInfoFetchFailure(t *testing.T) {
 			return service.GoogleUserInfo{}, errors.New("boom")
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{}, &fakeAuditRecorder{})
 
 	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err == nil {
@@ -1132,8 +1231,9 @@ func TestLogout(t *testing.T) {
 		sub:      defaultSub(),
 	}
 	revoker := &fakeSessionRevoker{}
+	recorder := &fakeAuditRecorder{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).Logout(context.Background(), sessionID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder).Logout(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1142,6 +1242,12 @@ func TestLogout(t *testing.T) {
 	}
 	if revoker.revokedSessionID != sessionID {
 		t.Errorf("expected SessionRevoker to be called with %s, got %s", sessionID, revoker.revokedSessionID)
+	}
+	if recorder.lastEventType != models.AuditLogout {
+		t.Errorf("expected AuditLogout, got %v", recorder.lastEventType)
+	}
+	if recorder.lastMetadata["session_id"] != sessionID.String() {
+		t.Errorf("expected metadata session_id=%s, got %v", sessionID, recorder.lastMetadata)
 	}
 }
 
@@ -1155,8 +1261,9 @@ func TestLogoutAll(t *testing.T) {
 		sub:      defaultSub(),
 	}
 	revoker := &fakeSessionRevoker{}
+	recorder := &fakeAuditRecorder{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).LogoutAll(context.Background(), userID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder).LogoutAll(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1165,6 +1272,12 @@ func TestLogoutAll(t *testing.T) {
 	}
 	if sessions.revokedAllForUser != userID {
 		t.Errorf("expected all sessions for user %s to be revoked, got %v", userID, sessions.revokedAllForUser)
+	}
+	if recorder.lastEventType != models.AuditLogoutAll {
+		t.Errorf("expected AuditLogoutAll, got %v", recorder.lastEventType)
+	}
+	if recorder.lastUserID == nil || *recorder.lastUserID != userID {
+		t.Errorf("expected recorded userID %s, got %v", userID, recorder.lastUserID)
 	}
 }
 
@@ -1221,7 +1334,8 @@ func TestRequestEmailVerification_Success(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	if err := svc.RequestEmailVerification(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1233,6 +1347,12 @@ func TestRequestEmailVerification_Success(t *testing.T) {
 	}
 	if emailSvc.verificationToken == "" {
 		t.Error("expected a non-empty raw token to be sent")
+	}
+	if recorder.lastEventType != models.AuditEmailVerificationRequested {
+		t.Errorf("expected AuditEmailVerificationRequested, got %v", recorder.lastEventType)
+	}
+	if recorder.lastUserID == nil || *recorder.lastUserID != userID {
+		t.Errorf("expected recorded userID %s, got %v", userID, recorder.lastUserID)
 	}
 }
 
@@ -1247,7 +1367,8 @@ func TestRequestEmailVerification_UnknownEmail(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	if err := svc.RequestEmailVerification(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -1256,6 +1377,9 @@ func TestRequestEmailVerification_UnknownEmail(t *testing.T) {
 	}
 	if emailSvc.verificationEmail != "" {
 		t.Error("no email should be sent for an unknown email")
+	}
+	if recorder.callCount != 0 {
+		t.Errorf("no audit event should be recorded for the silent unknown-email no-op, got %v", recorder.lastEventType)
 	}
 }
 
@@ -1273,7 +1397,8 @@ func TestRequestEmailVerification_AlreadyVerified(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	if err := svc.RequestEmailVerification(context.Background(), "ada@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -1282,6 +1407,9 @@ func TestRequestEmailVerification_AlreadyVerified(t *testing.T) {
 	}
 	if emailSvc.verificationEmail != "" {
 		t.Error("no email should be sent for an already-verified email")
+	}
+	if recorder.callCount != 0 {
+		t.Errorf("no audit event should be recorded for the silent already-verified no-op, got %v", recorder.lastEventType)
 	}
 }
 
@@ -1310,7 +1438,9 @@ func TestVerifyEmail_Success(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	user, sub, hasPassword, err := newTestAuthService(repo).VerifyEmail(context.Background(), "some-raw-token")
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	user, sub, hasPassword, err := svc.VerifyEmail(context.Background(), "some-raw-token")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1328,6 +1458,9 @@ func TestVerifyEmail_Success(t *testing.T) {
 	}
 	if hasPassword {
 		t.Error("expected hasPassword to be false (fakeIdentityRepo defaults to ErrUserNotFound)")
+	}
+	if recorder.lastEventType != models.AuditEmailVerified {
+		t.Errorf("expected AuditEmailVerified, got %v", recorder.lastEventType)
 	}
 }
 
@@ -1440,7 +1573,8 @@ func TestRequestPasswordReset_Success(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	if err := svc.RequestPasswordReset(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1452,6 +1586,9 @@ func TestRequestPasswordReset_Success(t *testing.T) {
 	}
 	if emailSvc.passwordResetToken == "" {
 		t.Error("expected a non-empty raw token to be sent")
+	}
+	if recorder.lastEventType != models.AuditPasswordResetRequested {
+		t.Errorf("expected AuditPasswordResetRequested, got %v", recorder.lastEventType)
 	}
 }
 
@@ -1466,7 +1603,8 @@ func TestRequestPasswordReset_UnknownEmail(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	if err := svc.RequestPasswordReset(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -1475,6 +1613,9 @@ func TestRequestPasswordReset_UnknownEmail(t *testing.T) {
 	}
 	if emailSvc.passwordResetEmail != "" {
 		t.Error("no email should be sent for an unknown email")
+	}
+	if recorder.callCount != 0 {
+		t.Errorf("no audit event should be recorded for the silent unknown-email no-op, got %v", recorder.lastEventType)
 	}
 }
 
@@ -1508,8 +1649,9 @@ func TestResetPassword_Success(t *testing.T) {
 		passwordReset: tokens,
 	}
 	revoker := &fakeSessionRevoker{}
+	recorder := &fakeAuditRecorder{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).ResetPassword(context.Background(), "some-raw-token", "New-Correct1!")
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder).ResetPassword(context.Background(), "some-raw-token", "New-Correct1!")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1524,6 +1666,9 @@ func TestResetPassword_Success(t *testing.T) {
 	}
 	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedSessionID {
 		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedSessionID}, revoker.revokedSessionIDs)
+	}
+	if recorder.lastEventType != models.AuditPasswordResetCompleted {
+		t.Errorf("expected AuditPasswordResetCompleted, got %v", recorder.lastEventType)
 	}
 }
 

@@ -19,13 +19,14 @@ import (
 type userService struct {
 	repository.Repository
 	sessions SessionRevoker
+	audit    AuditRecorder
 }
 
-// NewUserService builds a userService backed by the given repositories and
-// session revoker, embedding the repository so profile flows can reach all
-// entity repositories and WithinTx directly.
-func NewUserService(repos repository.Repository, sessions SessionRevoker) *userService {
-	return &userService{Repository: repos, sessions: sessions}
+// NewUserService builds a userService backed by the given repositories,
+// session revoker, and audit recorder, embedding the repository so profile
+// flows can reach all entity repositories and WithinTx directly.
+func NewUserService(repos repository.Repository, sessions SessionRevoker, audit AuditRecorder) *userService {
+	return &userService{Repository: repos, sessions: sessions, audit: audit}
 }
 
 // GetMe returns the user identified by userID together with their active
@@ -116,7 +117,11 @@ func (s *userService) ChangePassword(ctx context.Context, userID uuid.UUID, sess
 	if err != nil {
 		return err
 	}
-	return s.sessions.RevokeSessions(ctx, revokedSessionIDs)
+	if err := s.sessions.RevokeSessions(ctx, revokedSessionIDs); err != nil {
+		return err
+	}
+	s.audit.Record(ctx, models.AuditPasswordChanged, &userID, nil)
+	return nil
 }
 
 // UpdateProfile applies a partial update to the caller's profile: each
@@ -155,7 +160,30 @@ func (s *userService) UpdateProfile(ctx context.Context, userID uuid.UUID, input
 		}
 	}
 
-	return s.User().UpdateProfile(ctx, userID, input)
+	updated, err := s.User().UpdateProfile(ctx, userID, input)
+	if err != nil {
+		return models.User{}, err
+	}
+
+	var changedFields []string
+	if input.Name != nil {
+		changedFields = append(changedFields, "name")
+	}
+	if input.AvatarURL != nil {
+		changedFields = append(changedFields, "avatar_url")
+	}
+	if input.CompanyName != nil {
+		changedFields = append(changedFields, "company_name")
+	}
+	if input.Description != nil {
+		changedFields = append(changedFields, "description")
+	}
+	if input.SocialLinks != nil {
+		changedFields = append(changedFields, "social_links")
+	}
+	s.audit.Record(ctx, models.AuditProfileUpdated, &userID, map[string]any{"changed_fields": changedFields})
+
+	return updated, nil
 }
 
 // SetPassword sets an initial password on an account that doesn't have one
@@ -213,7 +241,11 @@ func (s *userService) SetPassword(ctx context.Context, userID, sessionID uuid.UU
 	if err != nil {
 		return err
 	}
-	return s.sessions.RevokeSessions(ctx, revokedSessionIDs)
+	if err := s.sessions.RevokeSessions(ctx, revokedSessionIDs); err != nil {
+		return err
+	}
+	s.audit.Record(ctx, models.AuditPasswordSet, &userID, nil)
+	return nil
 }
 
 // DeleteAccount soft-deletes the caller's account (sets deleted_at, hiding
@@ -258,5 +290,9 @@ func (s *userService) DeleteAccount(ctx context.Context, userID, sessionID uuid.
 	if err != nil {
 		return err
 	}
-	return s.sessions.RevokeSessions(ctx, revokedSessionIDs)
+	if err := s.sessions.RevokeSessions(ctx, revokedSessionIDs); err != nil {
+		return err
+	}
+	s.audit.Record(ctx, models.AuditAccountDeleted, &userID, nil)
+	return nil
 }

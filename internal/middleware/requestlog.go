@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"linkMe/internal/utils/logctx"
+	"linkMe/internal/utils/reqctx"
 	"log/slog"
 	"net/http"
 	"time"
@@ -13,9 +14,10 @@ import (
 // unique request ID, injects a logger enriched with that ID into the
 // request context (retrievable via LoggerFromContext, or by any layer via
 // logctx.FromContext), sets the ID on the X-Request-ID response header for
-// client-side correlation, and emits one structured access-log line per
-// request after it completes, recording method, path, status, and
-// duration.
+// client-side correlation, injects the request's client IP/User-Agent/ID as
+// a reqctx.Meta (retrievable via reqctx.FromContext — used today by audit
+// logging), and emits one structured access-log line per request after it
+// completes, recording method, path, status, and duration.
 //
 // RequestLogger should be the outermost middleware in router.SetupRoutes
 // (wrapping SecurityHeaders/CORS/the mux) so it observes every request,
@@ -30,6 +32,11 @@ func RequestLogger(base *slog.Logger) func(http.Handler) http.Handler {
 
 			logger := base.With("request_id", requestID)
 			ctx := logctx.WithLogger(r.Context(), logger)
+			ctx = reqctx.WithMeta(ctx, reqctx.Meta{
+				IP:        reqctx.ClientIP(r),
+				UserAgent: r.Header.Get("User-Agent"),
+				RequestID: requestID,
+			})
 
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			start := time.Now()

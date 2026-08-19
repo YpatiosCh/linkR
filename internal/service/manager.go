@@ -25,9 +25,10 @@ func NewServiceManager(repos repository.Repository, cfg config.Config) Service {
 	sessionRevoker := redis.NewSessionRevocationStore(cfg.RedisClient)
 	googleClient := NewGoogleOAuthClient(http.DefaultClient, cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL)
 	loginLimiter := redis.NewLoginAttemptLimiter(cfg.RedisClient, loginAttemptLimit, loginAttemptWindow)
+	auditService := NewAuditService(repos.AuditEvent())
 	return &ServiceManager{
-		authService:  NewAuthService(repos, cfg, emailService, sessionRevoker, googleClient, loginLimiter),
-		userService:  NewUserService(repos, sessionRevoker),
+		authService:  NewAuthService(repos, cfg, emailService, sessionRevoker, googleClient, loginLimiter, auditService),
+		userService:  NewUserService(repos, sessionRevoker, auditService),
 		emailService: emailService,
 	}
 }

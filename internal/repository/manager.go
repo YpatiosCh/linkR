@@ -16,6 +16,7 @@ type RepoManager struct {
 	sessionRepo                SessionRepository
 	emailVerificationTokenRepo EmailVerificationTokenRepository
 	passwordResetTokenRepo     PasswordResetTokenRepository
+	auditEventRepo             AuditEventRepository
 }
 
 // NewRepoManager wires the pool into each entity repository and returns
@@ -29,6 +30,7 @@ func NewRepoManager(pool *pgxpool.Pool) Repository {
 		sessionRepo:                NewSessionRepository(pool),
 		emailVerificationTokenRepo: NewEmailVerificationTokenRepository(pool),
 		passwordResetTokenRepo:     NewPasswordResetTokenRepository(pool),
+		auditEventRepo:             NewAuditEventRepository(pool),
 	}
 }
 
@@ -79,4 +81,9 @@ func (r *RepoManager) EmailVerificationToken() EmailVerificationTokenRepository 
 // PasswordResetToken returns the password reset token repository.
 func (r *RepoManager) PasswordResetToken() PasswordResetTokenRepository {
 	return r.passwordResetTokenRepo
+}
+
+// AuditEvent returns the audit event repository.
+func (r *RepoManager) AuditEvent() AuditEventRepository {
+	return r.auditEventRepo
 }

@@ -103,6 +103,25 @@ type LoginAttemptLimiter interface {
 	Allow(ctx context.Context, email string) (bool, error)
 }
 
+// AuditRecorder persists security/account-relevant events to the
+// audit_events table. Both AuthService and UserService take one as a
+// constructor dependency and call it after the outcome (success or a
+// specific, meaningful failure) of a flow is already determined. Satisfied
+// by *auditService (this package) — declared here for the same reason as
+// SessionRevoker/LoginAttemptLimiter: to keep call sites decoupled and
+// fakeable in tests.
+type AuditRecorder interface {
+	// Record persists an audit event for eventType, optionally scoped to
+	// userID (nil for pre-authentication events, e.g. a failed login
+	// against an unrecognized email). IP, User-Agent, and the request ID
+	// are read from ctx (see internal/utils/reqctx) and the request ID is
+	// merged into metadata automatically so every row correlates with its
+	// structured log line. Never returns an error: a write failure is
+	// logged and swallowed inside the implementation so it can never block
+	// or fail the action being audited.
+	Record(ctx context.Context, eventType models.AuditEventType, userID *uuid.UUID, metadata map[string]any)
+}
+
 // UserService defines the operations exposed by the service layer for the
 // authenticated current-user resource, such as profile retrieval and
 // password changes.

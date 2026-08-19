@@ -28,6 +28,8 @@ type Repository interface {
 	EmailVerificationToken() EmailVerificationTokenRepository
 	// PasswordResetToken returns the password reset token repository.
 	PasswordResetToken() PasswordResetTokenRepository
+	// AuditEvent returns the audit event repository.
+	AuditEvent() AuditEventRepository
 }
 
 // UserRepository defines the data-access operations for users.
@@ -154,4 +156,13 @@ type PasswordResetTokenRepository interface {
 	// MarkPasswordResetTokenConsumed sets used_at on the token with the
 	// given ID.
 	MarkPasswordResetTokenConsumed(ctx context.Context, id uuid.UUID) error
+}
+
+// AuditEventRepository defines the data-access operations for audit
+// events — an append-only log, so there is no update/mark-consumed
+// operation.
+type AuditEventRepository interface {
+	// CreateAuditEvent persists a new audit event and returns the stored
+	// event.
+	CreateAuditEvent(ctx context.Context, e models.AuditEvent) (models.AuditEvent, error)
 }

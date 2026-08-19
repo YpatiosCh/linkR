@@ -1162,7 +1162,11 @@ HSTS is gated on `AppEnv` because it mandates HTTPS and would break local HTTP d
 
 ---
 
-# 31. Audit Events ⬜ TODO — `audit_events` table exists; no repository/service writes events yet
+# 31. Audit Events ✅ DONE (2026-08-19) — `internal/models/audit_event.go` (taxonomy),
+`internal/repository/audit_event_repository.go`, `internal/service/audit_service.go`
+(`AuditRecorder`) write events from every auth/user flow; see
+`DOCS/ARCHITECTURE_AND_RULES.md` §9 for the full event list and design (fire-and-forget,
+IP/User-Agent/request ID via `internal/utils/reqctx`)
 
 Authentication events should be recorded.
 
@@ -1791,7 +1795,7 @@ Build authentication in this order:
 21. ✅ Password change
 22. ⬜ Account deletion
 23. ⬜ Recent-authentication checks
-24. ⬜ Audit events
+24. ✅ Audit events
 25. ✅ Rate limiting
 
 ### Phase D — Google
@@ -1846,7 +1850,7 @@ Authentication V1 is considered complete when:
 - ⬜ Protected resources enforce ownership.
 - ⬜ Plan limits can be enforced independently of authentication.
 - ⬜ Account deletion revokes authentication.
-- ⬜ Security-sensitive events are auditable.
+- ✅ Security-sensitive events are auditable. (see §31)
 - ✅ Authentication endpoints are rate-limited. (per-route fixed-window in `internal/middleware/ratelimit/`)
 - ⬜ OAuth state and identity claims are validated.
 - 🟡 Automated unit, integration, and security tests pass. (unit + handler tests ✅; integration/security tests ⬜)
@@ -2696,7 +2700,7 @@ A table is a storage implementation detail; it is not automatically a business d
 32. ⬜ Password change
 33. ⬜ Google login
 34. ⬜ Google identity linking
-35. ⬜ Audit events
+35. ✅ Audit events
 
 ## Phase E — Middleware
 
@@ -2761,7 +2765,7 @@ It is complete when:
 - ✅ Sensitive tokens are never stored plaintext. (hashed refresh tokens, Argon2id passwords)
 - ✅ Passwords use Argon2id.
 - ✅ Secrets never appear in logs.
-- ⬜ Security events are auditable.
+- ✅ Security events are auditable. (see §31)
 - ✅ Dependency injection is used throughout the application boundary. (constructor DI; composition root in main.go)
 - ✅ Handlers do not contain business logic.
 - ✅ Repositories do not contain business logic.

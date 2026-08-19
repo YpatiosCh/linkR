@@ -3,9 +3,9 @@ package redis
 import (
 	"context"
 	"fmt"
+	"linkMe/internal/utils/reqctx"
 	"linkMe/internal/utils/response"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -13,14 +13,13 @@ import (
 // shared across every server instance via client: at most limit requests
 // per window. name namespaces the counters in Redis — since the counter
 // store is now shared rather than one isolated Go map per call site, each
-// route needs an explicit identity.
-//
-// IP extraction: X-Real-IP is preferred (set by a trusted reverse proxy);
-// RemoteAddr is the fallback.
+// route needs an explicit identity. IP extraction is reqctx.ClientIP —
+// X-Real-IP is preferred (set by a trusted reverse proxy); RemoteAddr is
+// the fallback.
 func NewRateLimiter(client *Client, name string, limit int, window time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			allowed, err := allow(r.Context(), client, name, clientIP(r), limit, window)
+			allowed, err := allow(r.Context(), client, name, reqctx.ClientIP(r), limit, window)
 			if err != nil {
 				response.Error(w, http.StatusInternalServerError, response.CodeInternalError, "something went wrong")
 				return
@@ -51,15 +50,4 @@ func allow(ctx context.Context, client *Client, name, ip string, limit int, wind
 		}
 	}
 	return count <= int64(limit), nil
-}
-
-func clientIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	addr := r.RemoteAddr
-	if i := strings.LastIndex(addr, ":"); i != -1 {
-		return addr[:i]
-	}
-	return addr
 }

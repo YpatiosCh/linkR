@@ -34,14 +34,15 @@ type authService struct {
 	sessions     SessionRevoker
 	google       GoogleOAuthClient
 	loginLimiter LoginAttemptLimiter
+	audit        AuditRecorder
 }
 
 // NewAuthService builds an authService backed by the given repositories,
 // application config, email service, session revoker, Google OAuth client,
-// and login attempt limiter, embedding the repository so auth flows can
-// reach all entity repositories and WithinTx directly.
-func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService, sessions SessionRevoker, google GoogleOAuthClient, loginLimiter LoginAttemptLimiter) *authService {
-	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions, google: google, loginLimiter: loginLimiter}
+// login attempt limiter, and audit recorder, embedding the repository so
+// auth flows can reach all entity repositories and WithinTx directly.
+func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService, sessions SessionRevoker, google GoogleOAuthClient, loginLimiter LoginAttemptLimiter, audit AuditRecorder) *authService {
+	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions, google: google, loginLimiter: loginLimiter, audit: audit}
 }
 
 // Register handles user registration: it normalizes and validates the
@@ -124,6 +125,7 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 		return models.User{}, models.TokenPair{}, err
 	}
 
+	s.audit.Record(ctx, models.AuditUserRegistered, &createdUser.ID, map[string]any{"provider": "password"})
 	return createdUser, pair, nil
 }
 
@@ -169,6 +171,7 @@ func (s *authService) attachPasswordIdentity(ctx context.Context, existingUser m
 	if err != nil {
 		return models.User{}, models.TokenPair{}, err
 	}
+	s.audit.Record(ctx, models.AuditPasswordIdentityAttached, &existingUser.ID, nil)
 	return existingUser, pair, nil
 }
 
@@ -226,6 +229,7 @@ func (s *authService) reactivateAccount(ctx context.Context, deletedUser models.
 	if err != nil {
 		return models.User{}, models.TokenPair{}, err
 	}
+	s.audit.Record(ctx, models.AuditAccountReactivated, &reactivatedUser.ID, nil)
 	return reactivatedUser, pair, nil
 }
 
@@ -276,6 +280,7 @@ func (s *authService) GoogleCallback(ctx context.Context, code string) (models.U
 		if err != nil {
 			return models.User{}, models.TokenPair{}, err
 		}
+		s.audit.Record(ctx, models.AuditGoogleLogin, &user.ID, nil)
 		return user, pair, nil
 	}
 	if !errors.Is(err, msgs.ErrUserNotFound) {
@@ -301,6 +306,7 @@ func (s *authService) GoogleCallback(ctx context.Context, code string) (models.U
 		if err != nil {
 			return models.User{}, models.TokenPair{}, err
 		}
+		s.audit.Record(ctx, models.AuditGoogleLinked, &existingUser.ID, nil)
 		return existingUser, pair, nil
 	}
 	if !errors.Is(err, msgs.ErrUserNotFound) {
@@ -357,6 +363,7 @@ func (s *authService) GoogleCallback(ctx context.Context, code string) (models.U
 		return models.User{}, models.TokenPair{}, err
 	}
 
+	s.audit.Record(ctx, models.AuditUserRegistered, &createdUser.ID, map[string]any{"provider": "google"})
 	return createdUser, pair, nil
 }
 
@@ -390,12 +397,14 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 		return models.User{}, models.TokenPair{}, err
 	}
 	if !allowed {
+		s.audit.Record(ctx, models.AuditLoginRateLimited, nil, map[string]any{"email": email})
 		return models.User{}, models.TokenPair{}, msgs.ErrTooManyLoginAttempts
 	}
 
 	identity, err := s.AuthIdentity().GetAuthIdentityByProviderAndSubject(ctx, "password", email)
 	if err != nil {
 		if errors.Is(err, msgs.ErrUserNotFound) {
+			s.audit.Record(ctx, models.AuditLoginFailed, nil, map[string]any{"email": email})
 			return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 		}
 		return models.User{}, models.TokenPair{}, err
@@ -405,6 +414,7 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 	// authenticate by password; return the generic error rather than
 	// msgs.ErrPasswordNotSet so login never reveals that the account exists.
 	if identity.PasswordHash == nil {
+		s.audit.Record(ctx, models.AuditLoginFailed, nil, map[string]any{"email": email})
 		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
@@ -413,6 +423,7 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 		return models.User{}, models.TokenPair{}, fmt.Errorf("error verifying password: %w", err)
 	}
 	if !ok {
+		s.audit.Record(ctx, models.AuditLoginFailed, nil, map[string]any{"email": email})
 		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 	}
 
@@ -427,6 +438,7 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 	user, err := s.User().GetUserByID(ctx, identity.UserID)
 	if err != nil {
 		if errors.Is(err, msgs.ErrUserNotFound) {
+			s.audit.Record(ctx, models.AuditLoginFailed, nil, map[string]any{"email": email})
 			return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
 		}
 		return models.User{}, models.TokenPair{}, err
@@ -442,6 +454,7 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 		return models.User{}, models.TokenPair{}, err
 	}
 
+	s.audit.Record(ctx, models.AuditLoginSucceeded, &user.ID, nil)
 	return user, pair, nil
 }
 
@@ -467,6 +480,7 @@ func (s *authService) Refresh(ctx context.Context, rawRefreshToken string) (mode
 		if ids, err := s.Session().RevokeSessionFamily(ctx, session.TokenFamilyID); err == nil {
 			_ = s.sessions.RevokeSessions(ctx, ids)
 		}
+		s.audit.Record(ctx, models.AuditRefreshTokenReuseDetected, &session.UserID, nil)
 		return models.User{}, models.TokenPair{}, msgs.ErrTokenReuseDetected
 	}
 
@@ -518,6 +532,11 @@ func (s *authService) Logout(ctx context.Context, sessionID uuid.UUID) error {
 	if err := s.sessions.RevokeSession(ctx, sessionID); err != nil {
 		return fmt.Errorf("logout: %w", err)
 	}
+	// Logout is only ever called with the caller's own session ID (from JWT
+	// claims), but this method itself has no user ID to attach — record the
+	// session ID in metadata instead of doing an extra lookup just for the
+	// audit trail.
+	s.audit.Record(ctx, models.AuditLogout, nil, map[string]any{"session_id": sessionID.String()})
 	return nil
 }
 
@@ -533,6 +552,7 @@ func (s *authService) LogoutAll(ctx context.Context, userID uuid.UUID) error {
 	if err := s.sessions.RevokeSessions(ctx, ids); err != nil {
 		return fmt.Errorf("logout all: %w", err)
 	}
+	s.audit.Record(ctx, models.AuditLogoutAll, &userID, nil)
 	return nil
 }
 
@@ -574,6 +594,7 @@ func (s *authService) RequestEmailVerification(ctx context.Context, email string
 	if err := s.email.SendVerificationEmail(ctx, email, rawToken); err != nil {
 		return fmt.Errorf("sending verification email: %w", err)
 	}
+	s.audit.Record(ctx, models.AuditEmailVerificationRequested, &user.ID, nil)
 	return nil
 }
 
@@ -623,6 +644,7 @@ func (s *authService) VerifyEmail(ctx context.Context, rawToken string) (models.
 	if err != nil {
 		return models.User{}, models.Subscription{}, false, err
 	}
+	s.audit.Record(ctx, models.AuditEmailVerified, &t.UserID, nil)
 	return user, sub, hasPassword, nil
 }
 
@@ -661,6 +683,7 @@ func (s *authService) RequestPasswordReset(ctx context.Context, email string) er
 	if err := s.email.SendPasswordResetEmail(ctx, email, rawToken); err != nil {
 		return fmt.Errorf("sending password reset email: %w", err)
 	}
+	s.audit.Record(ctx, models.AuditPasswordResetRequested, &user.ID, nil)
 	return nil
 }
 
@@ -725,7 +748,11 @@ func (s *authService) ResetPassword(ctx context.Context, rawToken string, newPas
 	if err != nil {
 		return err
 	}
-	return s.sessions.RevokeSessions(ctx, revokedSessionIDs)
+	if err := s.sessions.RevokeSessions(ctx, revokedSessionIDs); err != nil {
+		return err
+	}
+	s.audit.Record(ctx, models.AuditPasswordResetCompleted, &t.UserID, nil)
+	return nil
 }
 
 // issueTokenPair generates a fresh token pair starting a new token family.

@@ -32,7 +32,7 @@ func TestGetMeSuccess(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	user, sub, hasPassword, err := service.NewUserService(repo, &fakeSessionRevoker{}).GetMe(context.Background(), userID)
+	user, sub, hasPassword, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).GetMe(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestGetMeUserNotFound(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	_, _, _, err := service.NewUserService(repo, &fakeSessionRevoker{}).GetMe(context.Background(), uuid.New())
+	_, _, _, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).GetMe(context.Background(), uuid.New())
 	if !errors.Is(err, msgs.ErrUserNotFound) {
 		t.Fatalf("expected ErrUserNotFound, got %v", err)
 	}
@@ -74,7 +74,7 @@ func TestGetMeHasPasswordFalseForOAuthOnlyAccount(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	_, _, hasPassword, err := service.NewUserService(repo, &fakeSessionRevoker{}).GetMe(context.Background(), userID)
+	_, _, hasPassword, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).GetMe(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -102,8 +102,9 @@ func TestChangePasswordSuccess(t *testing.T) {
 		sub:      defaultSub(),
 	}
 	revoker := &fakeSessionRevoker{}
+	recorder := &fakeAuditRecorder{}
 
-	err := service.NewUserService(repo, revoker).ChangePassword(
+	err := service.NewUserService(repo, revoker, recorder).ChangePassword(
 		context.Background(), userID, sessionID, "Old-Correct1!", "New-Correct1!",
 	)
 	if err != nil {
@@ -120,6 +121,12 @@ func TestChangePasswordSuccess(t *testing.T) {
 	}
 	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedSessionID {
 		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedSessionID}, revoker.revokedSessionIDs)
+	}
+	if recorder.lastEventType != models.AuditPasswordChanged {
+		t.Errorf("expected AuditPasswordChanged, got %v", recorder.lastEventType)
+	}
+	if recorder.lastUserID == nil || *recorder.lastUserID != userID {
+		t.Errorf("expected recorded userID %s, got %v", userID, recorder.lastUserID)
 	}
 }
 
@@ -138,7 +145,7 @@ func TestChangePasswordInvalidCredentials(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	err := service.NewUserService(repo, &fakeSessionRevoker{}).ChangePassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).ChangePassword(
 		context.Background(), userID, uuid.New(), "wrong-password", "New-Correct1!",
 	)
 	if !errors.Is(err, msgs.ErrInvalidCredentials) {
@@ -156,7 +163,7 @@ func TestChangePasswordOAuthOnlyAccount(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	err := service.NewUserService(repo, &fakeSessionRevoker{}).ChangePassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).ChangePassword(
 		context.Background(), userID, uuid.New(), "any", "New-Correct1!",
 	)
 	if !errors.Is(err, msgs.ErrPasswordNotSet) {
@@ -178,7 +185,7 @@ func TestChangePasswordWeakNewPassword(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	err := service.NewUserService(repo, &fakeSessionRevoker{}).ChangePassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).ChangePassword(
 		context.Background(), userID, uuid.New(), "Correct-Battery1!", "weak",
 	)
 	if !errors.Is(err, msgs.ErrInvalidCredentials) {
@@ -205,7 +212,8 @@ func TestSetPasswordSuccess(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	err := service.NewUserService(repo, revoker).SetPassword(
+	recorder := &fakeAuditRecorder{}
+	err := service.NewUserService(repo, revoker, recorder).SetPassword(
 		context.Background(), userID, sessionID, "Correct-Horse1!",
 	)
 	if err != nil {
@@ -232,6 +240,9 @@ func TestSetPasswordSuccess(t *testing.T) {
 	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedSessionID {
 		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedSessionID}, revoker.revokedSessionIDs)
 	}
+	if recorder.lastEventType != models.AuditPasswordSet {
+		t.Errorf("expected AuditPasswordSet, got %v", recorder.lastEventType)
+	}
 }
 
 func TestSetPasswordAlreadySet(t *testing.T) {
@@ -248,7 +259,7 @@ func TestSetPasswordAlreadySet(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	err := service.NewUserService(repo, &fakeSessionRevoker{}).SetPassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).SetPassword(
 		context.Background(), userID, uuid.New(), "Correct-Horse1!",
 	)
 	if !errors.Is(err, msgs.ErrPasswordAlreadySet) {
@@ -258,7 +269,7 @@ func TestSetPasswordAlreadySet(t *testing.T) {
 
 func TestSetPasswordWeakNewPassword(t *testing.T) {
 	repo := newTestUserRepo()
-	err := service.NewUserService(repo, &fakeSessionRevoker{}).SetPassword(
+	err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).SetPassword(
 		context.Background(), uuid.New(), uuid.New(), "weak",
 	)
 	if !errors.Is(err, msgs.ErrInvalidCredentials) {
@@ -280,7 +291,8 @@ func newTestUserRepo() *fakeRepo {
 func TestUpdateProfileSuccess_EachFieldIndependently(t *testing.T) {
 	userID := uuid.New()
 	repo := newTestUserRepo()
-	svc := service.NewUserService(repo, &fakeSessionRevoker{})
+	recorder := &fakeAuditRecorder{}
+	svc := service.NewUserService(repo, &fakeSessionRevoker{}, recorder)
 
 	user, err := svc.UpdateProfile(context.Background(), userID, models.UpdateProfileInput{
 		Name: strPtr("Jane"),
@@ -329,11 +341,27 @@ func TestUpdateProfileSuccess_EachFieldIndependently(t *testing.T) {
 	if len(user.SocialLinks.Other) != 1 || user.SocialLinks.Other[0].Label != "Slack" {
 		t.Errorf("SocialLinks.Other: got %v, want one Slack entry", user.SocialLinks.Other)
 	}
+	if recorder.lastEventType != models.AuditProfileUpdated {
+		t.Errorf("expected AuditProfileUpdated, got %v", recorder.lastEventType)
+	}
+	if recorder.callCount != 3 {
+		t.Errorf("expected one audit event per successful UpdateProfile call, got %d", recorder.callCount)
+	}
+	changedFields, _ := recorder.lastMetadata["changed_fields"].([]string)
+	wantFields := []string{"company_name", "description", "social_links"}
+	if len(changedFields) != len(wantFields) {
+		t.Fatalf("changed_fields: got %v, want %v", changedFields, wantFields)
+	}
+	for i, f := range wantFields {
+		if changedFields[i] != f {
+			t.Errorf("changed_fields[%d]: got %q, want %q", i, changedFields[i], f)
+		}
+	}
 }
 
 func TestUpdateProfileInvalidName(t *testing.T) {
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(), models.UpdateProfileInput{Name: strPtr("")},
 	)
 	if !errors.Is(err, msgs.ErrInvalidInput) {
@@ -343,7 +371,7 @@ func TestUpdateProfileInvalidName(t *testing.T) {
 
 func TestUpdateProfileInvalidCompanyName(t *testing.T) {
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{CompanyName: strPtr(strings.Repeat("a", validate.MaxCompanyNameLength+1))},
 	)
@@ -354,7 +382,7 @@ func TestUpdateProfileInvalidCompanyName(t *testing.T) {
 
 func TestUpdateProfileInvalidDescription(t *testing.T) {
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{Description: strPtr(strings.Repeat("a", validate.MaxDescriptionLength+1))},
 	)
@@ -365,7 +393,7 @@ func TestUpdateProfileInvalidDescription(t *testing.T) {
 
 func TestUpdateProfileInvalidAvatarURL(t *testing.T) {
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{AvatarURL: strPtr("not-a-url")},
 	)
@@ -376,7 +404,7 @@ func TestUpdateProfileInvalidAvatarURL(t *testing.T) {
 
 func TestUpdateProfileUnknownSocialPlatform(t *testing.T) {
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{SocialLinks: &models.SocialLinks{
 			Platforms: map[models.SocialPlatform]string{"diskord": "https://discord.gg/xyz"},
@@ -389,7 +417,7 @@ func TestUpdateProfileUnknownSocialPlatform(t *testing.T) {
 
 func TestUpdateProfileInvalidSocialPlatformURL(t *testing.T) {
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{SocialLinks: &models.SocialLinks{
 			Platforms: map[models.SocialPlatform]string{models.SocialPlatformDiscord: "not-a-url"},
@@ -406,7 +434,7 @@ func TestUpdateProfileTooManyOtherSocialLinks(t *testing.T) {
 		other[i] = models.CustomSocialLink{Label: "Custom", URL: "https://example.com"}
 	}
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{SocialLinks: &models.SocialLinks{Other: other}},
 	)
@@ -417,7 +445,7 @@ func TestUpdateProfileTooManyOtherSocialLinks(t *testing.T) {
 
 func TestUpdateProfileInvalidCustomSocialLink(t *testing.T) {
 	repo := newTestUserRepo()
-	_, err := service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{SocialLinks: &models.SocialLinks{
 			Other: []models.CustomSocialLink{{Label: "", URL: "https://example.com"}},
@@ -427,7 +455,7 @@ func TestUpdateProfileInvalidCustomSocialLink(t *testing.T) {
 		t.Fatalf("expected ErrInvalidInput for a custom link with an empty label, got %v", err)
 	}
 
-	_, err = service.NewUserService(repo, &fakeSessionRevoker{}).UpdateProfile(
+	_, err = service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).UpdateProfile(
 		context.Background(), uuid.New(),
 		models.UpdateProfileInput{SocialLinks: &models.SocialLinks{
 			Other: []models.CustomSocialLink{{Label: "Slack", URL: "not-a-url"}},
@@ -458,8 +486,9 @@ func TestDeleteAccountSuccess_WithPassword(t *testing.T) {
 		sub:     defaultSub(),
 	}
 	revoker := &fakeSessionRevoker{}
+	recorder := &fakeAuditRecorder{}
 
-	err := service.NewUserService(repo, revoker).DeleteAccount(context.Background(), userID, sessionID, "Correct-Battery1!")
+	err := service.NewUserService(repo, revoker, recorder).DeleteAccount(context.Background(), userID, sessionID, "Correct-Battery1!")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -471,6 +500,9 @@ func TestDeleteAccountSuccess_WithPassword(t *testing.T) {
 	}
 	if len(revoker.revokedSessionIDs) != 1 || revoker.revokedSessionIDs[0] != revokedSessionID {
 		t.Errorf("expected SessionRevoker to be called with %v, got %v", []uuid.UUID{revokedSessionID}, revoker.revokedSessionIDs)
+	}
+	if recorder.lastEventType != models.AuditAccountDeleted {
+		t.Errorf("expected AuditAccountDeleted, got %v", recorder.lastEventType)
 	}
 }
 
@@ -485,7 +517,7 @@ func TestDeleteAccountSuccess_OAuthOnly(t *testing.T) {
 		sub:      defaultSub(),
 	}
 
-	err := service.NewUserService(repo, &fakeSessionRevoker{}).DeleteAccount(context.Background(), userID, uuid.New(), "")
+	err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).DeleteAccount(context.Background(), userID, uuid.New(), "")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -508,7 +540,7 @@ func TestDeleteAccountWrongPassword(t *testing.T) {
 		sub:     defaultSub(),
 	}
 
-	err := service.NewUserService(repo, &fakeSessionRevoker{}).DeleteAccount(context.Background(), userID, uuid.New(), "wrong-password")
+	err := service.NewUserService(repo, &fakeSessionRevoker{}, &fakeAuditRecorder{}).DeleteAccount(context.Background(), userID, uuid.New(), "wrong-password")
 	if !errors.Is(err, msgs.ErrInvalidCredentials) {
 		t.Fatalf("expected ErrInvalidCredentials for wrong password, got %v", err)
 	}
