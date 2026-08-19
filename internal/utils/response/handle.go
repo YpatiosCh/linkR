@@ -25,6 +25,7 @@ var errorStatusMap = map[error]struct {
 	msgs.ErrSubscriptionNotFound: {http.StatusInternalServerError, CodeInternalError},
 	msgs.ErrInvalidInput:         {http.StatusBadRequest, CodeInvalidInput},
 	msgs.ErrPasswordAlreadySet:   {http.StatusConflict, CodePasswordAlreadySet},
+	msgs.ErrTooManyLoginAttempts: {http.StatusTooManyRequests, CodeTooManyRequests},
 }
 
 // HandleError writes a JSON error response for the given error, associated

@@ -160,7 +160,7 @@
                 "login"
               ]
             },
-            "description": "200 OK, same body/cookie shape as Register. 401 INVALID_CREDENTIALS covers unknown email, wrong password, a deleted account, and OAuth-only accounts identically (enumeration defense — none of these are distinguishable from the response). Rate limit: 10/15min."
+            "description": "200 OK, same body/cookie shape as Register. 401 INVALID_CREDENTIALS covers unknown email, wrong password, a deleted account, and OAuth-only accounts identically (enumeration defense — none of these are distinguishable from the response). 429 TOO_MANY_REQUESTS can come from either of two independent limiters: the per-IP route limit (10/15min, message \"rate limit exceeded\") or a per-account limiter keyed on the normalized email (5/15min, message \"too many login attempts, please try again later\") that throttles repeated attempts against one specific account regardless of which IP they come from. Rate limit: 10/15min per IP, plus 5/15min per email."
           },
           "response": []
         },

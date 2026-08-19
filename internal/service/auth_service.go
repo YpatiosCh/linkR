@@ -21,24 +21,27 @@ const (
 	sessionDuration                = 30 * 24 * time.Hour // 30 days
 	emailVerificationTokenDuration = 24 * time.Hour
 	passwordResetTokenDuration     = time.Hour
+	loginAttemptLimit              = 5
+	loginAttemptWindow             = 15 * time.Minute
 )
 
 // authService implements AuthService by combining the embedded shared
 // repository with the business rules for authentication.
 type authService struct {
 	repository.Repository
-	cfg      config.Config
-	email    EmailService
-	sessions SessionRevoker
-	google   GoogleOAuthClient
+	cfg          config.Config
+	email        EmailService
+	sessions     SessionRevoker
+	google       GoogleOAuthClient
+	loginLimiter LoginAttemptLimiter
 }
 
 // NewAuthService builds an authService backed by the given repositories,
-// application config, email service, session revoker, and Google OAuth
-// client, embedding the repository so auth flows can reach all entity
-// repositories and WithinTx directly.
-func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService, sessions SessionRevoker, google GoogleOAuthClient) *authService {
-	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions, google: google}
+// application config, email service, session revoker, Google OAuth client,
+// and login attempt limiter, embedding the repository so auth flows can
+// reach all entity repositories and WithinTx directly.
+func NewAuthService(repos repository.Repository, cfg config.Config, emailSvc EmailService, sessions SessionRevoker, google GoogleOAuthClient, loginLimiter LoginAttemptLimiter) *authService {
+	return &authService{Repository: repos, cfg: cfg, email: emailSvc, sessions: sessions, google: google, loginLimiter: loginLimiter}
 }
 
 // Register handles user registration: it normalizes and validates the
@@ -365,7 +368,9 @@ func (s *authService) GoogleCallback(ctx context.Context, code string) (models.U
 // (e.g. OAuth-only), or a wrong password — returns the same
 // msgs.ErrInvalidCredentials so the response never reveals whether the email
 // exists (account-enumeration defense). Unexpected repository or hashing
-// failures are returned wrapped.
+// failures are returned wrapped. Returns msgs.ErrTooManyLoginAttempts if the
+// normalized email has exceeded its login attempt limit, independent of the
+// per-IP rate limit already applied to the route.
 func (s *authService) Login(ctx context.Context, input models.LoginInput) (models.User, models.TokenPair, error) {
 	email := validate.NormalizeEmail(input.Email)
 
@@ -374,6 +379,18 @@ func (s *authService) Login(ctx context.Context, input models.LoginInput) (model
 	}
 	if !validate.Password(input.Password) {
 		return models.User{}, models.TokenPair{}, msgs.ErrInvalidCredentials
+	}
+
+	// Keyed on the normalized email, independent of the caller's IP — closes
+	// the gap where an attacker distributes login attempts against one
+	// account across many IPs. Increments on every attempt, successful or
+	// not, so a correct guess can't be used to reset the counter.
+	allowed, err := s.loginLimiter.Allow(ctx, email)
+	if err != nil {
+		return models.User{}, models.TokenPair{}, err
+	}
+	if !allowed {
+		return models.User{}, models.TokenPair{}, msgs.ErrTooManyLoginAttempts
 	}
 
 	identity, err := s.AuthIdentity().GetAuthIdentityByProviderAndSubject(ctx, "password", email)

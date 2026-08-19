@@ -31,7 +31,9 @@ type AuthService interface {
 	// issues a new session, returning the authenticated user plus a
 	// models.TokenPair. It returns the same msgs.ErrInvalidCredentials for
 	// every authentication failure so callers cannot distinguish an unknown
-	// email from a wrong password.
+	// email from a wrong password. Returns msgs.ErrTooManyLoginAttempts if
+	// the normalized email has exceeded its login attempt limit, independent
+	// of the caller's IP.
 	Login(ctx context.Context, input models.LoginInput) (models.User, models.TokenPair, error)
 	// Refresh validates the given raw refresh token, rotates it (consuming the
 	// old session row and creating a new one in the same token family), and
@@ -86,6 +88,19 @@ type AuthService interface {
 	// new user, google identity, and free subscription. Returns
 	// msgs.ErrOAuthEmailNotVerified if Google reports the email unverified.
 	GoogleCallback(ctx context.Context, code string) (models.User, models.TokenPair, error)
+}
+
+// LoginAttemptLimiter guards against distributed credential-stuffing
+// attacks against a single account: unlike the per-IP rate limiter
+// wrapping the login route, this is keyed on the normalized email, so an
+// attacker spreading attempts across many IPs against one account is still
+// throttled. Satisfied by *redis.LoginAttemptLimiter (linkMe/internal/redis)
+// — declared here, not imported from there, mirroring SessionRevoker.
+type LoginAttemptLimiter interface {
+	// Allow reports whether another login attempt for the given normalized
+	// email is permitted right now, incrementing its attempt counter as a
+	// side effect.
+	Allow(ctx context.Context, email string) (bool, error)
 }
 
 // UserService defines the operations exposed by the service layer for the

@@ -33,4 +33,7 @@ var (
 	// ErrPasswordAlreadySet is returned when SetPassword is called on an
 	// account that already has a password identity — use ChangePassword instead.
 	ErrPasswordAlreadySet = errors.New("password already configured for this account")
+	// ErrTooManyLoginAttempts is returned when an account has exceeded its
+	// email-keyed login attempt limit, independent of the caller's IP.
+	ErrTooManyLoginAttempts = errors.New("too many login attempts, please try again later")
 )

@@ -58,7 +58,7 @@ func (f *fakeRepo) PasswordResetToken() repository.PasswordResetTokenRepository 
 // session-revocation behavior are only asserted by the tests that
 // construct and inspect their own fakes.
 func newTestAuthService(repo *fakeRepo) service.AuthService {
-	return service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
+	return service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
 }
 
 // fakeGoogleOAuthClient is a fake service.GoogleOAuthClient with optional
@@ -104,6 +104,26 @@ func (f *fakeSessionRevoker) RevokeSession(ctx context.Context, sessionID uuid.U
 func (f *fakeSessionRevoker) RevokeSessions(ctx context.Context, sessionIDs []uuid.UUID) error {
 	f.revokedSessionIDs = sessionIDs
 	return f.err
+}
+
+// fakeLoginAttemptLimiter is a spy service.LoginAttemptLimiter. Allow
+// defaults to permitting every attempt (allowed: true is the zero value's
+// intent, so a nil allow func just returns true) and records the last
+// email it was called with so tests can assert the limiter is keyed on the
+// normalized email.
+type fakeLoginAttemptLimiter struct {
+	allow     func(ctx context.Context, email string) (bool, error)
+	lastEmail string
+	callCount int
+}
+
+func (f *fakeLoginAttemptLimiter) Allow(ctx context.Context, email string) (bool, error) {
+	f.lastEmail = email
+	f.callCount++
+	if f.allow != nil {
+		return f.allow(ctx, email)
+	}
+	return true, nil
 }
 
 // defaultSub returns a minimal fakeSubscriptionRepo that always reports
@@ -505,6 +525,106 @@ func TestLoginInvalidCredentials(t *testing.T) {
 	}
 }
 
+func TestLoginTooManyAttempts(t *testing.T) {
+	// The limiter denies even though the credentials below are otherwise
+	// valid — the attempt limit must be checked before any credential
+	// verification, not used as a tiebreaker after.
+	repo := &fakeRepo{
+		identity: &fakeIdentityRepo{
+			get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
+				t.Fatal("identity lookup should not run once the login attempt limit is exceeded")
+				return models.AuthIdentity{}, nil
+			},
+		},
+		user: &fakeUserRepo{
+			getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+				t.Fatal("user lookup should not run once the login attempt limit is exceeded")
+				return models.User{}, nil
+			},
+		},
+		session: &fakeSessionRepo{},
+		sub:     defaultSub(),
+	}
+
+	limiter := &fakeLoginAttemptLimiter{allow: func(ctx context.Context, email string) (bool, error) {
+		return false, nil
+	}}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter)
+
+	_, _, err := svc.Login(context.Background(), models.LoginInput{
+		Email:    "user@example.com",
+		Password: "Correct-Horse1!",
+	})
+	if !errors.Is(err, msgs.ErrTooManyLoginAttempts) {
+		t.Fatalf("expected ErrTooManyLoginAttempts, got %v", err)
+	}
+}
+
+func TestLoginAttemptLimiterKeyedOnNormalizedEmail(t *testing.T) {
+	userID := uuid.New()
+	identity := passwordIdentity(t, userID, "Correct-Horse1!")
+	repo := &fakeRepo{
+		identity: &fakeIdentityRepo{
+			get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
+				return identity, nil
+			},
+		},
+		user: &fakeUserRepo{
+			getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
+				return models.User{ID: userID, Email: "user@example.com"}, nil
+			},
+		},
+		session: &fakeSessionRepo{},
+		sub:     defaultSub(),
+	}
+
+	limiter := &fakeLoginAttemptLimiter{}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter)
+
+	// Casing/whitespace variants of the same address must key the limiter
+	// identically to what the identity lookup itself normalizes to.
+	_, _, err := svc.Login(context.Background(), models.LoginInput{
+		Email:    "  User@Example.com ",
+		Password: "Correct-Horse1!",
+	})
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if limiter.lastEmail != "user@example.com" {
+		t.Errorf("expected limiter to be called with normalized email %q, got %q", "user@example.com", limiter.lastEmail)
+	}
+	if limiter.callCount != 1 {
+		t.Errorf("expected exactly 1 limiter call, got %d", limiter.callCount)
+	}
+}
+
+func TestLoginAttemptLimiterErrorPropagates(t *testing.T) {
+	repo := &fakeRepo{
+		identity: &fakeIdentityRepo{
+			get: func(ctx context.Context, provider, subject string) (models.AuthIdentity, error) {
+				t.Fatal("identity lookup should not run when the limiter check itself fails")
+				return models.AuthIdentity{}, nil
+			},
+		},
+		session: &fakeSessionRepo{},
+		sub:     defaultSub(),
+	}
+
+	limiterErr := errors.New("redis unavailable")
+	limiter := &fakeLoginAttemptLimiter{allow: func(ctx context.Context, email string) (bool, error) {
+		return false, limiterErr
+	}}
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, limiter)
+
+	_, _, err := svc.Login(context.Background(), models.LoginInput{
+		Email:    "user@example.com",
+		Password: "Correct-Horse1!",
+	})
+	if !errors.Is(err, limiterErr) {
+		t.Fatalf("expected the limiter error to propagate, got %v", err)
+	}
+}
+
 func TestRefreshSuccess(t *testing.T) {
 	userID := uuid.New()
 	sessionID := uuid.New()
@@ -574,7 +694,7 @@ func TestRefreshReuseDetected(t *testing.T) {
 	sessions.revokedFamilyIDs = []uuid.UUID{revokedFamilyID}
 	revoker := &fakeSessionRevoker{}
 
-	_, _, err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).Refresh(context.Background(), "old-consumed-token")
+	_, _, err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).Refresh(context.Background(), "old-consumed-token")
 	if !errors.Is(err, msgs.ErrTokenReuseDetected) {
 		t.Fatalf("expected ErrTokenReuseDetected, got %v", err)
 	}
@@ -814,7 +934,7 @@ func TestGoogleAuthURL_Success(t *testing.T) {
 			return "https://accounts.google.com/o/oauth2/v2/auth?state=" + state
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
 
 	authURL, state, err := svc.GoogleAuthURL(context.Background())
 	if err != nil {
@@ -856,7 +976,7 @@ func TestGoogleCallback_ExistingGoogleUser(t *testing.T) {
 			return googleInfo("google-sub-1", "ada@example.com"), nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
 
 	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err != nil {
@@ -894,7 +1014,7 @@ func TestGoogleCallback_AttachToExistingPasswordAccount(t *testing.T) {
 			return googleInfo("google-sub-2", "ada@example.com"), nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
 
 	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err != nil {
@@ -928,7 +1048,7 @@ func TestGoogleCallback_NewUser(t *testing.T) {
 			return googleInfo("google-sub-3", "new-google-user@example.com"), nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
 
 	user, pair, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err != nil {
@@ -964,7 +1084,7 @@ func TestGoogleCallback_EmailNotVerified(t *testing.T) {
 			return service.GoogleUserInfo{Subject: "google-sub-4", Email: "unverified@example.com", EmailVerified: false}, nil
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
 
 	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if !errors.Is(err, msgs.ErrOAuthEmailNotVerified) {
@@ -979,7 +1099,7 @@ func TestGoogleCallback_ExchangeFailure(t *testing.T) {
 			return "", errors.New("boom")
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
 
 	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err == nil {
@@ -994,7 +1114,7 @@ func TestGoogleCallback_UserInfoFetchFailure(t *testing.T) {
 			return service.GoogleUserInfo{}, errors.New("boom")
 		},
 	}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google)
+	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, google, &fakeLoginAttemptLimiter{})
 
 	_, _, err := svc.GoogleCallback(context.Background(), "auth-code")
 	if err == nil {
@@ -1013,7 +1133,7 @@ func TestLogout(t *testing.T) {
 	}
 	revoker := &fakeSessionRevoker{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).Logout(context.Background(), sessionID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).Logout(context.Background(), sessionID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1036,7 +1156,7 @@ func TestLogoutAll(t *testing.T) {
 	}
 	revoker := &fakeSessionRevoker{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).LogoutAll(context.Background(), userID)
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).LogoutAll(context.Background(), userID)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1101,7 +1221,7 @@ func TestRequestEmailVerification_Success(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
 	if err := svc.RequestEmailVerification(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1127,7 +1247,7 @@ func TestRequestEmailVerification_UnknownEmail(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
 	if err := svc.RequestEmailVerification(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -1153,7 +1273,7 @@ func TestRequestEmailVerification_AlreadyVerified(t *testing.T) {
 		emailVerification: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
 	if err := svc.RequestEmailVerification(context.Background(), "ada@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -1320,7 +1440,7 @@ func TestRequestPasswordReset_Success(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
 	if err := svc.RequestPasswordReset(context.Background(), "  Ada@Example.com "); err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -1346,7 +1466,7 @@ func TestRequestPasswordReset_UnknownEmail(t *testing.T) {
 		passwordReset: tokens,
 	}
 
-	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{})
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{})
 	if err := svc.RequestPasswordReset(context.Background(), "unknown@example.com"); err != nil {
 		t.Fatalf("expected silent success, got error: %v", err)
 	}
@@ -1389,7 +1509,7 @@ func TestResetPassword_Success(t *testing.T) {
 	}
 	revoker := &fakeSessionRevoker{}
 
-	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}).ResetPassword(context.Background(), "some-raw-token", "New-Correct1!")
+	err := service.NewAuthService(repo, testCfg, &fakeEmailService{}, revoker, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}).ResetPassword(context.Background(), "some-raw-token", "New-Correct1!")
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}

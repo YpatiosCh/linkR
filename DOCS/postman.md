@@ -231,6 +231,27 @@ Everything else is generous enough for normal manual testing:
 
 A `429` means `CodeTooManyRequests` — wait out the window.
 
+**Login has a second, independent limit on top of the 10/15min per-IP one
+above:** a per-account limiter keyed on the normalized email, 5 attempts per
+15 minutes (`internal/redis/login_attempt_limiter.go`), closing the gap
+where an attacker spreads login attempts against one specific account
+across many different IPs — the per-IP limiter alone never sees more than a
+few attempts from any single IP in that scenario. Both limiters respond the
+same way (`429 TOO_MANY_REQUESTS`) but with different messages — "rate
+limit exceeded" (IP) vs. "too many login attempts, please try again later"
+(email) — so you can tell which one tripped. QA combinations for Login:
+
+1. **Happy path** — correct email/password → `200 OK`.
+2. **Email-keyed limit, distinct from the IP limit** — run Login 5 times in
+   a row with the *same* email and a deliberately *wrong* password; the 6th
+   attempt returns `429` with the email-keyed message, even though you're
+   well under the IP limiter's 10-request threshold. Wait 15 minutes (or
+   restart Redis) before running Login again with that email.
+3. **Independent per email** — after tripping the limit for one email in
+   combo 2, Login with a *different* email still succeeds (or fails with
+   the normal `401`), proving the counters don't share state across
+   accounts.
+
 Token lifetimes: verification tokens last 24h, reset tokens 1h
 (`internal/service/auth_service.go`) — a token you grabbed earlier in a
 session is still valid for a while if you didn't get to use it immediately.

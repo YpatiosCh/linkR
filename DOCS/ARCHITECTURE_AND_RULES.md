@@ -724,7 +724,7 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-19 (panic recovery middleware, on top of: account deletion + reactivation; structured logging pipeline; two-phase registration + seller profile system; password/input validation hardening + self-service `SetPassword`; Google OAuth login/signup + email verification + password reset + Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
+Snapshot as of 2026-08-19 (per-account email-keyed login rate limiting + panic recovery middleware, on top of: account deletion + reactivation; structured logging pipeline; two-phase registration + seller profile system; password/input validation hardening + self-service `SetPassword`; Google OAuth login/signup + email verification + password reset + Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
 
 ### Implemented
 
@@ -826,7 +826,12 @@ Snapshot as of 2026-08-19 (panic recovery middleware, on top of: account deletio
   `UserService`, since — like `Register`/`Login`/`Refresh` — they're public/token-authenticated
   and never go through `RequireAuth`):
   - `AuthService.Register` — normalize/validate → email-exists check → Argon2id → transactional user+identity+free-plan → issue JWT + refresh token
-  - `AuthService.Login` — normalize/validate → password identity → VerifyPassword → issue JWT + refresh token; every failure → same `ErrInvalidCredentials` (enumeration defense)
+  - `AuthService.Login` — normalize/validate → email-keyed login-attempt-limit check
+    (`LoginAttemptLimiter.Allow`, denies with `ErrTooManyLoginAttempts`) → password identity →
+    VerifyPassword → issue JWT + refresh token; every credential failure → same
+    `ErrInvalidCredentials` (enumeration defense). The attempt limiter is independent of, and
+    additive to, the per-IP rate limiting already wrapping the route (`internal/redis/ratelimit.go`)
+    — see the `LoginAttemptLimiter` entry below
   - `AuthService.Refresh` — hash lookup → reuse detection (RevokedAt → RevokeFamily + ErrTokenReuseDetected) → expiry check → WithinTx(MarkConsumed + new session in same family) → new JWT + refresh token
   - `AuthService.Logout` — RevokeSession (idempotent)
   - `AuthService.LogoutAll` — RevokeAllSessionsForUser
@@ -927,6 +932,20 @@ Snapshot as of 2026-08-19 (panic recovery middleware, on top of: account deletio
     Satisfied by `*redis.SessionRevocationStore` (`internal/redis`),
     constructed once in `ServiceManager.NewServiceManager` from
     `cfg.RedisClient` and passed to both services.
+  - `LoginAttemptLimiter` (`Allow(ctx, email) (bool, error)`) — throttles login attempts
+    per normalized email, independent of and additive to the per-IP rate limiting already
+    wrapping the login route (`internal/redis/ratelimit.go`'s `NewRateLimiter`, 10/15min):
+    an attacker distributing attempts against one specific account across many IPs trips
+    this limiter even though no single IP crosses the per-IP threshold. `AuthService.Login`
+    calls it right after normalizing/validating the email and before any DB lookup — the
+    key can never diverge from the email the identity lookup itself uses a few lines later.
+    Denies with `msgs.ErrTooManyLoginAttempts` (mapped to `429 TOO_MANY_REQUESTS`, same code
+    the IP limiter uses, distinct message). Satisfied by `*redis.LoginAttemptLimiter`
+    (`internal/redis/login_attempt_limiter.go`, reuses the same fixed-window INCR+EXPIRE
+    helper as `NewRateLimiter` under a distinct Redis key prefix), constructed once in
+    `ServiceManager.NewServiceManager` with a 5-attempts/15-minute limit (tighter than the
+    IP limit since it targets one account, matching the 5/15min used elsewhere for
+    account-sensitive actions) and passed to `AuthService`.
 - **Handler layer**: `HandlerManager` + `AuthHandler` (Register/Login/Refresh/Logout/LogoutAll/
   RequestEmailVerification/VerifyEmail/RequestPasswordReset/ResetPassword/GoogleStart/
   GoogleCallback) + `UserHandler`
@@ -1080,7 +1099,8 @@ Snapshot as of 2026-08-19 (panic recovery middleware, on top of: account deletio
   `ErrInvalidCredentials` already covered every failure mode); Google OAuth added
   `ErrOAuthEmailNotVerified`; profile updates added `ErrInvalidInput` (400, for validation
   failures outside a credentials context — the first real use of the previously-unused
-  `CodeInvalidInput`); `SetPassword` added `ErrPasswordAlreadySet` (409).
+  `CodeInvalidInput`); `SetPassword` added `ErrPasswordAlreadySet` (409); the email-keyed
+  login attempt limiter added `ErrTooManyLoginAttempts` (429, `CodeTooManyRequests`).
 
 ### Not yet implemented (from the specs)
 
@@ -1105,13 +1125,6 @@ Snapshot as of 2026-08-19 (panic recovery middleware, on top of: account deletio
   credential, not an added factor. Would be its own dedicated design if ever wanted.
 - Automatic verification email on `Register` (verification is opt-in via
   `POST /api/v1/auth/email/verification/request` today — `Register` is unchanged)
-- Per-account brute-force protection — current rate limiting (`internal/redis/ratelimit.go`)
-  is per-IP only, keyed on `clientIP(r)`. An attacker distributing login attempts against one
-  specific account across many IPs isn't slowed by it. Needs an additional limiter keyed on
-  the normalized email (only meaningful on `Login`, since that's the only place an email is
-  submitted pre-authentication) — additive alongside the existing IP-based limiter, not a
-  replacement: IP-based catches one attacker hammering many accounts, account-based catches a
-  distributed attack against one account.
 - Everything in `plans_and_entitlements_v1_backend_spec.md` beyond the plan
   model and free-subscription-on-register behavior
 
@@ -1122,9 +1135,9 @@ Snapshot as of 2026-08-19 (panic recovery middleware, on top of: account deletio
 
 1. ~~**Panic recovery middleware**~~ — done (2026-08-19), see `internal/middleware/recover.go`
    under Middleware above.
-2. **Per-account (email-keyed) rate limiting on Login** — see the "Not yet implemented"
-   entry above for the exact gap; needs a small design decision (limit/window) but no
-   product-level ambiguity.
+2. ~~**Per-account (email-keyed) rate limiting on Login**~~ — done (2026-08-19), see
+   `LoginAttemptLimiter` under the Service layer above (5 attempts/15min per normalized
+   email, additive to the existing 10/15min per-IP limit on the route).
 3. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
    existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, SetPassword,
    UpdateProfile, DeleteAccount, the verification/reset/Google flows, …), not bolted onto
