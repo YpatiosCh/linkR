@@ -1,6 +1,6 @@
 # linkMe Backend — Architecture & Hard Rules
 
-> Last updated: 2026-08-16
+> Last updated: 2026-08-19
 > Applies to: the entire `linkMe` Go backend (module `linkMe`).
 
 This document is the single source of truth for **how this project is structured**
@@ -724,7 +724,7 @@ boundaries, spec vs. code conflicts — stop and ask before proceeding.
 
 ## 9. Current State of the Codebase
 
-Snapshot as of 2026-08-16 (account deletion + reactivation, on top of: structured logging pipeline; two-phase registration + seller profile system; password/input validation hardening + self-service `SetPassword`; Google OAuth login/signup + email verification + password reset + Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
+Snapshot as of 2026-08-19 (panic recovery middleware, on top of: account deletion + reactivation; structured logging pipeline; two-phase registration + seller profile system; password/input validation hardening + self-service `SetPassword`; Google OAuth login/signup + email verification + password reset + Redis-backed session revocation + rate limiting). Update this section whenever a milestone lands.
 
 ### Implemented
 
@@ -983,6 +983,7 @@ Snapshot as of 2026-08-16 (account deletion + reactivation, on top of: structure
   - `cors.go` — `CORS(allowedOrigins)`: explicit allowlist, echoes origin (never `*`), `Vary: Origin`, preflight 204
   - `securityheaders.go` — `SecurityHeaders(appEnv)`: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, `default-src 'none'` CSP, HSTS (production only)
   - `requestlog.go` — `RequestLogger(base *slog.Logger)`: assigns each request a `uuid.NewString()` request ID, sets it on the `X-Request-ID` response header, injects a logger enriched with it (`base.With("request_id", id)`) into the request context via `internal/utils/logctx`, wraps the response writer in an unexported `statusRecorder` to capture the status code, and logs one `Info` "http request" line per request (method/path/status/duration_ms) after it completes. `LoggerFromContext(r) *slog.Logger` is the handler-facing accessor (mirrors `AuthClaims(r)`), never nil (falls back to `slog.Default()` outside the middleware chain). Must be the outermost global middleware so it observes every request, including CORS preflights and unmatched routes, and the request ID exists before anything else runs.
+  - `recover.go` — `Recover()`: recovers any panic from a downstream handler, logs it at `Error` level (panic value + `runtime/debug.Stack()`) via the request-scoped logger (`logctx.FromContext`), and responds `500 INTERNAL_ERROR` via the existing `response.Error`/`response.CodeInternalError` instead of dropping the connection with an unstructured stderr trace (net/http's default per-connection recovery). Sits directly inside `RequestLogger` in the global chain — after `RequestLogger` so the request ID/logger are already in context when a panic is caught, and before everything else so `RequestLogger`'s deferred access-log line still observes the resulting 500 status.
   - `maxbody.go` — `MaxBody(limit int64)`: wraps `r.Body` in `http.MaxBytesReader(w, r.Body, limit)`. `MaxRequestBodyBytes = 1MB` — generous for today's text-only JSON API; scoped only to today's routes, not a blanket rule — product file uploads (once built) will go through a presigned R2 PUT URL directly, never through this server's handlers, so this cap never needs revisiting for that. A body over the limit surfaces as a normal JSON decode error (400 `INVALID_BODY` via `response.DecodeJSON`), not a distinct status — deliberate simplicity, not an oversight.
 - **Rate limiting** (`internal/redis/ratelimit.go`, not `internal/middleware/` — see
   `internal/redis` above): `NewRateLimiter(client, name, limit, window)` — per-IP fixed-window
@@ -1083,14 +1084,6 @@ Snapshot as of 2026-08-16 (account deletion + reactivation, on top of: structure
 
 ### Not yet implemented (from the specs)
 
-- Panic recovery middleware — Go's stdlib `net/http` already recovers a panic per-connection
-  so one handler panicking doesn't crash the process, but today that recovery just drops the
-  connection with no HTTP response and logs an unstructured stack trace to stderr, bypassing
-  `RequestLogger`'s structured logger and request-ID correlation entirely. Audited the
-  codebase for live, reachable panic sources (unchecked type assertions, unguarded pointer
-  dereferences, unchecked-length slice indexing) as of 2026-08-16 and found none — every
-  pointer dereference and type assertion in `internal/` is already guarded — so this is
-  defense-in-depth against third-party library panics and future code, not a fix for a known bug.
 - Google account linking/unlinking as explicit, authenticated self-service endpoints
   (`POST /api/v1/me/auth-identities/google/link`, `DELETE /api/v1/me/auth-identities/google`,
   auth spec §18) — login/signup (§17) is done, and it already links a `google` identity to an
@@ -1112,22 +1105,41 @@ Snapshot as of 2026-08-16 (account deletion + reactivation, on top of: structure
   credential, not an added factor. Would be its own dedicated design if ever wanted.
 - Automatic verification email on `Register` (verification is opt-in via
   `POST /api/v1/auth/email/verification/request` today — `Register` is unchanged)
+- Per-account brute-force protection — current rate limiting (`internal/redis/ratelimit.go`)
+  is per-IP only, keyed on `clientIP(r)`. An attacker distributing login attempts against one
+  specific account across many IPs isn't slowed by it. Needs an additional limiter keyed on
+  the normalized email (only meaningful on `Login`, since that's the only place an email is
+  submitted pre-authentication) — additive alongside the existing IP-based limiter, not a
+  replacement: IP-based catches one attacker hammering many accounts, account-based catches a
+  distributed attack against one account.
 - Everything in `plans_and_entitlements_v1_backend_spec.md` beyond the plan
   model and free-subscription-on-register behavior
 
 ### Suggested next steps (in order of priority)
 
-1. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
+**Chosen by the user (2026-08-16) as the priority set to clear before moving on to
+`plans_and_entitlements_v1_backend_spec.md` (plans, entitlements, and billing features):**
+
+1. ~~**Panic recovery middleware**~~ — done (2026-08-19), see `internal/middleware/recover.go`
+   under Middleware above.
+2. **Per-account (email-keyed) rate limiting on Login** — see the "Not yet implemented"
+   entry above for the exact gap; needs a small design decision (limit/window) but no
+   product-level ambiguity.
+3. **Audit events** — one cross-cutting pass wiring `audit_events` writes into every
    existing endpoint (Register, Login, Logout, LogoutAll, ChangePassword, SetPassword,
    UpdateProfile, DeleteAccount, the verification/reset/Google flows, …), not bolted onto
-   one feature at a time
-2. **Panic recovery middleware** — cheap, no design decisions, no known live bug; do
-   whenever convenient
-3. **Sensitive operations / recent authentication** (auth spec §33) — needs a definition of
+   one feature at a time. The biggest of the three — do last so the event schema can also
+   capture failed-login events from #2 if that overlap turns out to be wanted.
+
+**After the three above:**
+
+4. **Sensitive operations / recent authentication** (auth spec §33) — needs a definition of
    what counts as "sensitive" and how "recent" a login must be before this is actionable
-4. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
-5. **Google account linking/unlinking** — the explicit self-service endpoints from §18;
+5. **Plans & entitlements** — `plans_and_entitlements_v1_backend_spec.md`
+6. **Google account linking/unlinking** — the explicit self-service endpoints from §18;
    deprioritized by the user as not urgent
+7. **New-device/new-location login alerts** — deliberately deferred; see the "Not yet
+   implemented" entry above and `DOCS/PRODUCT_VISION.md` §11 for the reasoning
 
 ---
 

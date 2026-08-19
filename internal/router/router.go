@@ -11,8 +11,9 @@ import (
 
 // SetupRoutes registers all application routes on a new ServeMux, applies
 // per-route middleware (rate limiting, authentication), wraps the mux in global
-// middleware (request logging outermost, then security headers, then CORS),
-// and returns the assembled handler ready to pass to http.ListenAndServe.
+// middleware (request logging outermost, then panic recovery, then security
+// headers, then CORS), and returns the assembled handler ready to pass to
+// http.ListenAndServe.
 func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -54,12 +55,17 @@ func SetupRoutes(h handlers.Handler, cfg config.Config) http.Handler {
 
 	// Global middleware: request logging is outermost so it observes every
 	// request end-to-end (including CORS preflights and unmatched routes)
-	// and generates the request ID before anything else runs; security
-	// headers, CORS, and the request-body size cap wrap the mux as before.
+	// and generates the request ID before anything else runs; panic recovery
+	// sits directly inside it so a recovered panic still has the
+	// request-scoped logger in context and still lets the access-log line
+	// observe the resulting 500 status; security headers, CORS, and the
+	// request-body size cap wrap the mux as before.
 	return middleware.RequestLogger(cfg.Logger)(
-		middleware.SecurityHeaders(cfg.AppEnv)(
-			middleware.CORS(cfg.AllowedOrigins)(
-				middleware.MaxBody(middleware.MaxRequestBodyBytes)(mux),
+		middleware.Recover()(
+			middleware.SecurityHeaders(cfg.AppEnv)(
+				middleware.CORS(cfg.AllowedOrigins)(
+					middleware.MaxBody(middleware.MaxRequestBodyBytes)(mux),
+				),
 			),
 		),
 	)
