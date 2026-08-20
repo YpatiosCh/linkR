@@ -9,6 +9,7 @@ import (
 	"linkMe/internal/msgs"
 	"linkMe/internal/repository"
 	"linkMe/internal/utils/jwttoken"
+	"linkMe/internal/utils/logctx"
 	"linkMe/internal/utils/token"
 	"linkMe/internal/utils/validate"
 	"linkMe/pkg/hash"
@@ -125,8 +126,26 @@ func (s *authService) Register(ctx context.Context, input models.RegisterInput) 
 		return models.User{}, models.TokenPair{}, err
 	}
 
+	s.sendVerificationEmailBestEffort(ctx, createdUser)
 	s.audit.Record(ctx, models.AuditUserRegistered, &createdUser.ID, map[string]any{"provider": "password"})
 	return createdUser, pair, nil
+}
+
+// sendVerificationEmailBestEffort auto-triggers RequestEmailVerification
+// after a password registration, so a first-time signup doesn't sit
+// unverified until the user thinks to hit "resend" themselves.
+// RequestEmailVerification already no-ops for an already-verified email, so
+// this is also what protects the case where the address was previously
+// verified via Google OAuth (GoogleCallback sets EmailVerifiedAt on
+// creation) - such a user attaching a password here or reactivating a
+// deleted account gets no spurious verification email. A failure here
+// (e.g. the email provider is down) must never fail registration itself -
+// the account is already created and usable; logged and swallowed, exactly
+// like AuditService.Record's write-failure handling.
+func (s *authService) sendVerificationEmailBestEffort(ctx context.Context, user models.User) {
+	if err := s.RequestEmailVerification(ctx, user.Email); err != nil {
+		logctx.FromContext(ctx).Error("register: failed to send verification email", "user_id", user.ID, "error", err)
+	}
 }
 
 // attachPasswordIdentity is called by Register when the requested email
@@ -171,6 +190,7 @@ func (s *authService) attachPasswordIdentity(ctx context.Context, existingUser m
 	if err != nil {
 		return models.User{}, models.TokenPair{}, err
 	}
+	s.sendVerificationEmailBestEffort(ctx, existingUser)
 	s.audit.Record(ctx, models.AuditPasswordIdentityAttached, &existingUser.ID, nil)
 	return existingUser, pair, nil
 }
@@ -229,6 +249,7 @@ func (s *authService) reactivateAccount(ctx context.Context, deletedUser models.
 	if err != nil {
 		return models.User{}, models.TokenPair{}, err
 	}
+	s.sendVerificationEmailBestEffort(ctx, reactivatedUser)
 	s.audit.Record(ctx, models.AuditAccountReactivated, &reactivatedUser.ID, nil)
 	return reactivatedUser, pair, nil
 }
@@ -325,14 +346,25 @@ func (s *authService) GoogleCallback(ctx context.Context, code string) (models.U
 		// are discarded rather than seeded, so there's no path by which
 		// creating an account (via any provider) can populate or override
 		// profile data; that only ever happens via UserService.UpdateProfile.
+		//
+		// CreateUser never writes email_verified_at itself (it's not one of
+		// its insert columns, by design — the password Register path must
+		// leave new accounts unverified). Google already verified this email
+		// (checked above via info.EmailVerified), so — and only on this
+		// provider="google" creation path, never for password Register — we
+		// explicitly mark it verified via the same UpdateEmailVerifiedAt
+		// call the email-verification-confirm flow uses.
 		user, err := s.User().CreateUser(ctx, models.User{
-			ID:              newUserID,
-			Email:           email,
-			EmailVerifiedAt: &verifiedAt,
+			ID:    newUserID,
+			Email: email,
 		})
 		if err != nil {
 			return err
 		}
+		if err := s.User().UpdateEmailVerifiedAt(ctx, newUserID); err != nil {
+			return err
+		}
+		user.EmailVerifiedAt = &verifiedAt
 		createdUser = user
 
 		_, err = s.AuthIdentity().CreateAuthIdentity(ctx, models.AuthIdentity{

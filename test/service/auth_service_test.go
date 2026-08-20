@@ -794,17 +794,26 @@ func TestRefreshExpiredSession(t *testing.T) {
 func TestRegisterSuccess(t *testing.T) {
 	sessions := &fakeSessionRepo{}
 	repo := &fakeRepo{
-		// getByEmail defaults to ErrUserNotFound — email is free
-		user: &fakeUserRepo{},
+		user: &fakeUserRepo{
+			// getByEmailIncludingDeleted defaults to ErrUserNotFound — email
+			// is free. getByEmail backs the post-register
+			// RequestEmailVerification lookup: a fresh password signup is
+			// never pre-verified, so this reports the new, unverified user.
+			getByEmail: func(ctx context.Context, email string) (models.User, error) {
+				return models.User{ID: uuid.New(), Email: "new@example.com"}, nil
+			},
+		},
 		identity: &fakeIdentityRepo{get: func(ctx context.Context, p, s string) (models.AuthIdentity, error) {
 			return models.AuthIdentity{}, msgs.ErrUserNotFound
 		}},
 		session: sessions,
 		sub:     defaultSub(),
+		emailVerification: &fakeEmailVerificationTokenRepo{},
 	}
 
 	recorder := &fakeAuditRecorder{}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	emailSvc := &fakeEmailService{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "  New@Example.com ",
 		Password: "Correct-Horse1!",
@@ -832,6 +841,12 @@ func TestRegisterSuccess(t *testing.T) {
 	}
 	if recorder.lastMetadata["provider"] != "password" {
 		t.Errorf("expected metadata provider=password, got %v", recorder.lastMetadata)
+	}
+	// A first-time password signup should be auto-sent a verification
+	// email, not left to sit unverified until the user thinks to hit
+	// "resend" themselves.
+	if emailSvc.verificationEmail != "new@example.com" {
+		t.Errorf("expected a verification email to be auto-sent to new@example.com, got %q", emailSvc.verificationEmail)
 	}
 }
 
@@ -868,7 +883,11 @@ func TestRegisterEmailAlreadyExists(t *testing.T) {
 }
 
 func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
-	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: strPtr("Ada")}
+	verifiedAt := time.Now().Add(-24 * time.Hour)
+	// A Google-created account is already email-verified (GoogleCallback
+	// sets EmailVerifiedAt on creation) - attaching a password here must not
+	// trigger a spurious verification email on top of that.
+	existingUser := models.User{ID: uuid.New(), Email: "ada@example.com", Name: strPtr("Ada"), EmailVerifiedAt: &verifiedAt}
 	identities := &fakeIdentityRepo{
 		getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
 			// The account only has a google identity — no password identity.
@@ -877,16 +896,23 @@ func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
 	}
 	sessions := &fakeSessionRepo{}
 	repo := &fakeRepo{
-		user: &fakeUserRepo{getByEmailIncludingDeleted: func(ctx context.Context, email string) (models.User, error) {
-			return existingUser, nil
-		}},
+		user: &fakeUserRepo{
+			getByEmailIncludingDeleted: func(ctx context.Context, email string) (models.User, error) {
+				return existingUser, nil
+			},
+			getByEmail: func(ctx context.Context, email string) (models.User, error) {
+				return existingUser, nil
+			},
+		},
 		identity: identities,
 		session:  sessions,
 		sub:      defaultSub(),
+		emailVerification: &fakeEmailVerificationTokenRepo{},
 	}
 
 	recorder := &fakeAuditRecorder{}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	emailSvc := &fakeEmailService{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "ada@example.com",
 		Password: "Correct-Horse1!",
@@ -909,6 +935,9 @@ func TestRegister_AttachPasswordToExistingGoogleAccount(t *testing.T) {
 	if recorder.lastEventType != models.AuditPasswordIdentityAttached {
 		t.Errorf("expected AuditPasswordIdentityAttached, got %v", recorder.lastEventType)
 	}
+	if emailSvc.verificationEmail != "" {
+		t.Errorf("expected no verification email for an already-verified (Google) account, but one was sent to %q", emailSvc.verificationEmail)
+	}
 }
 
 func TestRegister_ReactivatesDeletedAccount_WithExistingPassword(t *testing.T) {
@@ -921,6 +950,9 @@ func TestRegister_ReactivatesDeletedAccount_WithExistingPassword(t *testing.T) {
 			return identity, nil
 		},
 	}
+	// Was never verified before deletion either - reactivating it should
+	// still get a verification email, same as any other unverified account.
+	reactivated := models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada")}
 	users := &fakeUserRepo{
 		getByEmailIncludingDeleted: func(ctx context.Context, email string) (models.User, error) {
 			return deletedUser, nil
@@ -928,14 +960,18 @@ func TestRegister_ReactivatesDeletedAccount_WithExistingPassword(t *testing.T) {
 		getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
 			// Reactivate cleared deleted_at, so this now succeeds like any
 			// other non-deleted lookup.
-			return models.User{ID: userID, Email: "ada@example.com", Name: strPtr("Ada")}, nil
+			return reactivated, nil
+		},
+		getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return reactivated, nil
 		},
 	}
 	sessions := &fakeSessionRepo{}
-	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub()}
+	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub(), emailVerification: &fakeEmailVerificationTokenRepo{}}
 
 	recorder := &fakeAuditRecorder{}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	emailSvc := &fakeEmailService{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "ada@example.com",
 		Password: "New-Correct1!",
@@ -961,12 +997,21 @@ func TestRegister_ReactivatesDeletedAccount_WithExistingPassword(t *testing.T) {
 	if recorder.lastEventType != models.AuditAccountReactivated {
 		t.Errorf("expected AuditAccountReactivated, got %v", recorder.lastEventType)
 	}
+	if emailSvc.verificationEmail != "ada@example.com" {
+		t.Errorf("expected a verification email for this previously-unverified account, got %q", emailSvc.verificationEmail)
+	}
 }
 
 func TestRegister_ReactivatesDeletedAccount_WasOAuthOnly(t *testing.T) {
 	deletedAt := time.Now().Add(-24 * time.Hour)
+	verifiedAt := time.Now().Add(-48 * time.Hour)
 	userID := uuid.New()
-	deletedUser := models.User{ID: userID, Email: "ada@example.com", DeletedAt: &deletedAt}
+	// Was Google-only and already verified before deletion (GoogleCallback
+	// sets EmailVerifiedAt on creation) - reactivating it here, now with a
+	// password attached, must not send a spurious verification email for an
+	// address that's provably already been proven.
+	deletedUser := models.User{ID: userID, Email: "ada@example.com", DeletedAt: &deletedAt, EmailVerifiedAt: &verifiedAt}
+	reactivated := models.User{ID: userID, Email: "ada@example.com", EmailVerifiedAt: &verifiedAt}
 	identities := &fakeIdentityRepo{
 		getByUserAndProv: func(ctx context.Context, id uuid.UUID, provider string) (models.AuthIdentity, error) {
 			return models.AuthIdentity{}, msgs.ErrUserNotFound // was Google-only before deletion
@@ -977,14 +1022,18 @@ func TestRegister_ReactivatesDeletedAccount_WasOAuthOnly(t *testing.T) {
 			return deletedUser, nil
 		},
 		getByID: func(ctx context.Context, id uuid.UUID) (models.User, error) {
-			return models.User{ID: userID, Email: "ada@example.com"}, nil
+			return reactivated, nil
+		},
+		getByEmail: func(ctx context.Context, email string) (models.User, error) {
+			return reactivated, nil
 		},
 	}
 	sessions := &fakeSessionRepo{}
-	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub()}
+	repo := &fakeRepo{user: users, identity: identities, session: sessions, sub: defaultSub(), emailVerification: &fakeEmailVerificationTokenRepo{}}
 
 	recorder := &fakeAuditRecorder{}
-	svc := service.NewAuthService(repo, testCfg, &fakeEmailService{}, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
+	emailSvc := &fakeEmailService{}
+	svc := service.NewAuthService(repo, testCfg, emailSvc, &fakeSessionRevoker{}, &fakeGoogleOAuthClient{}, &fakeLoginAttemptLimiter{}, recorder)
 	user, pair, err := svc.Register(context.Background(), models.RegisterInput{
 		Email:    "ada@example.com",
 		Password: "New-Correct1!",
@@ -1006,6 +1055,9 @@ func TestRegister_ReactivatesDeletedAccount_WasOAuthOnly(t *testing.T) {
 	}
 	if recorder.lastEventType != models.AuditAccountReactivated {
 		t.Errorf("expected AuditAccountReactivated, got %v", recorder.lastEventType)
+	}
+	if emailSvc.verificationEmail != "" {
+		t.Errorf("expected no verification email for a previously-Google-verified account, but one was sent to %q", emailSvc.verificationEmail)
 	}
 }
 
